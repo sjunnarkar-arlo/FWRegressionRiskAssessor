@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>FW Regression Risk Assessor</title>
+<script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
 
@@ -453,10 +454,15 @@
           <option value="email">Email release notes</option>
         </select>
       </div>
+      <div class="field" id="ms-auth-field" style="display:none">
+        <label>Azure App Client ID <span style="font-size:10px;color:var(--hint)">(to search your inbox)</span></label>
+        <input type="text" id="ms-client-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" style="font-size:11px" />
+        <span id="ms-signin-status" style="font-family:var(--mono);font-size:10px;color:var(--hint);margin-top:3px;display:block"></span>
+      </div>
       <div id="email-paste-field" style="display:none">
         <div class="field">
-          <label>Paste release notes <span style="font-size:10px;color:var(--hint)">(fallback if auto-search fails)</span></label>
-          <textarea id="email-content" placeholder="Paste the release notes email body here…" style="background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:8px 10px;color:var(--text);font-family:var(--mono);font-size:11px;width:100%;height:90px;outline:none;resize:vertical;line-height:1.4"></textarea>
+          <label>Paste release notes <span style="font-size:10px;color:var(--hint)">(fallback if search fails)</span></label>
+          <textarea id="email-content" placeholder="Paste the release notes email body here…" style="background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:8px 10px;color:var(--text);font-family:var(--mono);font-size:11px;width:100%;height:80px;outline:none;resize:vertical;line-height:1.4"></textarea>
         </div>
       </div>
       <div class="field" style="margin-top:8px">
@@ -884,6 +890,29 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
   return { repos_searched: candidates, refs_used: refsUsed, commits: allCommits };
 }
 
+// ── EMAIL HELPERS ────────────────────────────────────────
+function extractEmailItems(content) {
+  const keyPattern = /\b([A-Z][A-Z0-9]+-\d+)\b/g;
+  const seen = new Set();
+  const items = [];
+  // Strip HTML tags if body came back as HTML
+  const text = content.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
+  for (const line of text.split(/[\n;]/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    keyPattern.lastIndex = 0;
+    const keys = [];
+    let m;
+    while ((m = keyPattern.exec(trimmed)) !== null) {
+      if (!seen.has(m[1])) seen.add(m[1]);
+      if (!keys.includes(m[1])) keys.push(m[1]);
+    }
+    if (keys.length) items.push({ sha: '—', msg: trimmed.slice(0, 200), repo: 'release-notes', keys });
+  }
+  if (!items.length) throw new Error('No Jira ticket keys (e.g. PEGA-123) found in the release notes.');
+  return { source: 'email', commits: items, repos_searched: ['email-release-notes'], refs_used: { 'email-release-notes': 'release-notes' } };
+}
+
 // ── EMAIL RELEASE NOTES SOURCE ───────────────────────────
 function parseEmailResponse(raw) {
   // Try JSON (double-quoted)
@@ -997,36 +1026,106 @@ async function fetchReleaseNotesViaMcp(modelId, fwVersion, client) {
     log(`Using pasted release notes: ${emailBody.length} chars`, 'success');
   }
 
-  // Extract ticket keys line-by-line (same approach as commit path)
-  const keyPattern = /\b([A-Z][A-Z0-9]+-\d+)\b/g;
-  const seen = new Set();
-  const items = [];
+  return extractEmailItems(emailBody);
+}
 
-  for (const line of emailBody.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    keyPattern.lastIndex = 0;
-    const keys = [];
-    let m;
-    while ((m = keyPattern.exec(trimmed)) !== null) {
-      if (!seen.has(m[1])) seen.add(m[1]);
-      if (!keys.includes(m[1])) keys.push(m[1]);
+// ── MICROSOFT GRAPH / MSAL ───────────────────────────────
+let _msalInstance = null;
+let _msAccessToken = null;
+
+function getMsalInstance(clientId) {
+  if (_msalInstance) return _msalInstance;
+  _msalInstance = new msal.PublicClientApplication({
+    auth: {
+      clientId,
+      authority: 'https://login.microsoftonline.com/common',
+      redirectUri: window.location.origin + window.location.pathname
+    },
+    cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: false }
+  });
+  return _msalInstance;
+}
+
+async function acquireMsToken(clientId) {
+  if (_msAccessToken) return _msAccessToken;
+  const instance = getMsalInstance(clientId);
+  const scopes = ['https://graph.microsoft.com/Mail.Read'];
+  const accounts = instance.getAllAccounts();
+  try {
+    const result = accounts.length
+      ? await instance.acquireTokenSilent({ scopes, account: accounts[0] })
+      : await instance.loginPopup({ scopes });
+    _msAccessToken = result.accessToken;
+    const name = result.account?.username || result.account?.name || '';
+    document.getElementById('ms-signin-status').textContent = `✓ signed in${name ? ` as ${name}` : ''}`;
+    return _msAccessToken;
+  } catch {
+    const result = await instance.acquireTokenPopup({ scopes });
+    _msAccessToken = result.accessToken;
+    const name = result.account?.username || result.account?.name || '';
+    document.getElementById('ms-signin-status').textContent = `✓ signed in${name ? ` as ${name}` : ''}`;
+    return _msAccessToken;
+  }
+}
+
+async function searchEmailViaGraph(token, modelId, fwVersion) {
+  // KQL: match subject containing version string (Graph uses KQL for $search)
+  const kql = `subject:"Release Notes" "${fwVersion}"`;
+  const url = `https://graph.microsoft.com/v1.0/me/messages` +
+    `?$search=${encodeURIComponent('"' + kql + '"')}` +
+    `&$select=id,subject,body,bodyPreview&$top=10`;
+
+  const resp = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Prefer': 'outlook.body-content-type="text"'
     }
-    if (keys.length) {
-      items.push({ sha: '—', msg: trimmed.slice(0, 200), repo: 'release-notes', keys });
-    }
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(`Graph API ${resp.status}: ${err.error?.message || 'email search failed'}`);
+  }
+  const data = await resp.json();
+  const emails = data.value || [];
+  log(`Graph returned ${emails.length} email(s)`, 'info');
+
+  if (!emails.length) {
+    throw new Error(`No email found for "${modelId}-${fwVersion}" in your inbox. Paste the email body in the sidebar to continue.`);
   }
 
-  if (!items.length) {
-    throw new Error(`No Jira ticket keys (e.g. PEGA-123) found in the release notes. Make sure the email contains ticket references.`);
+  const modelLower = modelId.toLowerCase(), verLower = fwVersion.toLowerCase();
+  const match =
+    emails.find(e => { const s = (e.subject||'').toLowerCase(); return s.includes('release notes') && s.includes(modelLower) && s.includes(verLower); }) ||
+    emails.find(e => { const s = (e.subject||'').toLowerCase(); return s.includes('release notes') && (s.includes(modelLower) || s.includes(verLower)); }) ||
+    emails[0];
+
+  log(`Matched: "${match.subject}"`, 'success');
+  return match.body?.content || match.bodyPreview || '';
+}
+
+// ── EMAIL RELEASE NOTES: MAIN ENTRY ─────────────────────
+// Priority: pasted content > Microsoft Graph > Arlochat MCP email tool
+async function fetchEmailReleaseNotes(modelId, fwVersion, client) {
+  // 1. Pasted content
+  const pasted = (document.getElementById('email-content')?.value || '').trim();
+  if (pasted) {
+    log(`Using pasted release notes: ${pasted.length} chars`, 'success');
+    return extractEmailItems(pasted);
   }
 
-  return {
-    source: 'email',
-    commits: items,
-    repos_searched: ['email-release-notes'],
-    refs_used: { 'email-release-notes': 'release-notes' }
-  };
+  // 2. Microsoft Graph API
+  const clientId = (document.getElementById('ms-client-id')?.value || '').trim();
+  if (clientId) {
+    log('Acquiring Microsoft token…', 'info');
+    const token = await acquireMsToken(clientId);
+    log('Searching inbox via Microsoft Graph…', 'tool');
+    const body = await searchEmailViaGraph(token, modelId, fwVersion);
+    log(`Email body: ${body.length} chars`, 'success');
+    return extractEmailItems(body);
+  }
+
+  // 3. Arlochat MCP email tool fallback
+  return fetchReleaseNotesViaMcp(modelId, fwVersion, client);
 }
 
 // ── DIRECT MCP: JIRA FULL READ ───────────────────────────
@@ -1485,9 +1584,12 @@ async function runAssessment() {
   // ── DIRECT MCP MODE ───────────────────────────────────
   if (useMcp) {
     const dataSource = document.getElementById('data-source').value;
-    const step1Label = dataSource === 'email'
-      ? `Email: release notes for ${modelId} ${fwVersion}`
-      : `GitHub: repos + commits for ${modelId}`;
+    const msClientId = (document.getElementById('ms-client-id')?.value || '').trim();
+    const step1Label = dataSource !== 'email'
+      ? `GitHub: repos + commits for ${modelId}`
+      : msClientId
+        ? `Outlook: searching inbox for ${modelId} ${fwVersion}`
+        : `Email: release notes for ${modelId} ${fwVersion}`;
 
     setLoading([
       'Connecting to Arlochat MCP',
@@ -1507,7 +1609,7 @@ async function runAssessment() {
 
       activateStep(1);
       const discovered = dataSource === 'email'
-        ? await fetchReleaseNotesViaMcp(modelId, fwVersion, client)
+        ? await fetchEmailReleaseNotes(modelId, fwVersion, client)
         : await discoverCommitsViaMcp(modelId, fwVersion, client);
       const { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
       const sourceLabel = dataSource === 'email' ? 'release notes' : 'commits';
@@ -1549,12 +1651,15 @@ document.getElementById('use-mcp').addEventListener('change', function() {
   document.getElementById('source-field').style.display = this.checked ? 'block' : 'none';
   if (!this.checked) {
     document.getElementById('email-paste-field').style.display = 'none';
+    document.getElementById('ms-auth-field').style.display = 'none';
     document.getElementById('data-source').value = 'github';
   }
 });
 
 document.getElementById('data-source').addEventListener('change', function() {
-  document.getElementById('email-paste-field').style.display = this.value === 'email' ? 'block' : 'none';
+  const isEmail = this.value === 'email';
+  document.getElementById('ms-auth-field').style.display = isEmail ? 'block' : 'none';
+  document.getElementById('email-paste-field').style.display = isEmail ? 'block' : 'none';
 });
 
 </script>
