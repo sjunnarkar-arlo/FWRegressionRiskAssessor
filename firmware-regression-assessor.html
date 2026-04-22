@@ -455,9 +455,11 @@
         </select>
       </div>
       <div class="field" id="ms-auth-field" style="display:none">
-        <label>Azure App Client ID <span style="font-size:10px;color:var(--hint)">(to search your inbox)</span></label>
+        <label>Azure App Client ID</label>
         <input type="text" id="ms-client-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" style="font-size:11px" />
-        <span id="ms-signin-status" style="font-family:var(--mono);font-size:10px;color:var(--hint);margin-top:3px;display:block"></span>
+        <label style="margin-top:6px">Tenant ID or domain <span style="font-size:10px;color:var(--hint)">(e.g. arlo.com)</span></label>
+        <input type="text" id="ms-tenant-id" placeholder="xxxxxxxx-… or arlo.com" style="font-size:11px;margin-top:4px" />
+        <span id="ms-signin-status" style="font-family:var(--mono);font-size:10px;color:var(--hint);margin-top:4px;display:block"></span>
       </div>
       <div id="email-paste-field" style="display:none">
         <div class="field">
@@ -1041,35 +1043,52 @@ async function fetchReleaseNotesViaMcp(modelId, fwVersion, client) {
 let _msalInstance = null;
 let _msAccessToken = null;
 
-function getMsalInstance(clientId) {
-  if (_msalInstance) return _msalInstance;
-  _msalInstance = new msal.PublicClientApplication({
-    auth: {
-      clientId,
-      authority: 'https://login.microsoftonline.com/common',
-      redirectUri: window.location.origin + window.location.pathname
-    },
-    cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: false }
-  });
-  return _msalInstance;
+async function resolveTenantId(input) {
+  if (!input) return 'common';
+  const s = input.trim().replace(/^@/, '');
+  // Already a GUID — use directly
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return s;
+  // Domain — discover tenant GUID via OIDC metadata endpoint
+  log(`Discovering tenant for "${s}"…`, 'info');
+  const resp = await fetch(`https://login.microsoftonline.com/${s}/v2.0/.well-known/openid-configuration`);
+  if (!resp.ok) throw new Error(`Could not discover tenant for domain "${s}" (${resp.status})`);
+  const data = await resp.json();
+  const m = data.issuer?.match(/\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\//i);
+  if (!m) throw new Error(`Could not parse tenant ID from discovery response for "${s}"`);
+  log(`Tenant ID: ${m[1]}`, 'success');
+  return m[1];
 }
 
 async function acquireMsToken(clientId) {
-  if (typeof msal === 'undefined') throw new Error('MSAL library failed to load — check your internet connection and reload the page.');
+  if (typeof msal === 'undefined') throw new Error('MSAL library failed to load — reload the page and try again.');
   if (_msAccessToken) return _msAccessToken;
-  const instance = getMsalInstance(clientId);
+
+  const tenantInput = (document.getElementById('ms-tenant-id')?.value || '').trim();
+  const tenantId = await resolveTenantId(tenantInput);
+
+  if (!_msalInstance) {
+    _msalInstance = new msal.PublicClientApplication({
+      auth: {
+        clientId,
+        authority: `https://login.microsoftonline.com/${tenantId}`,
+        redirectUri: window.location.origin + window.location.pathname
+      },
+      cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: false }
+    });
+  }
+
   const scopes = ['https://graph.microsoft.com/Mail.Read'];
-  const accounts = instance.getAllAccounts();
+  const accounts = _msalInstance.getAllAccounts();
   try {
     const result = accounts.length
-      ? await instance.acquireTokenSilent({ scopes, account: accounts[0] })
-      : await instance.loginPopup({ scopes });
+      ? await _msalInstance.acquireTokenSilent({ scopes, account: accounts[0] })
+      : await _msalInstance.loginPopup({ scopes });
     _msAccessToken = result.accessToken;
     const name = result.account?.username || result.account?.name || '';
     document.getElementById('ms-signin-status').textContent = `✓ signed in${name ? ` as ${name}` : ''}`;
     return _msAccessToken;
   } catch {
-    const result = await instance.acquireTokenPopup({ scopes });
+    const result = await _msalInstance.acquireTokenPopup({ scopes });
     _msAccessToken = result.accessToken;
     const name = result.account?.username || result.account?.name || '';
     document.getElementById('ms-signin-status').textContent = `✓ signed in${name ? ` as ${name}` : ''}`;
