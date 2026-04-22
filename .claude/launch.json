@@ -3,9 +3,10 @@
   "configurations": [
     {
       "name": "MCP proxy (use this for VPN/Arlochat)",
-      "runtimeExecutable": "python",
-      "runtimeArgs": ["proxy.py"],
-      "port": 8082
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["proxy.js"],
+      "port": 8082,
+      "autoPort": true
     },
     {
       "name": "Python static server",

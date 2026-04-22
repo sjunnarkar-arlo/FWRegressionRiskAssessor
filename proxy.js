@@ -9,7 +9,7 @@ const http = require('http');
 const fs   = require('fs');
 const path = require('path');
 
-const PORT        = 8082;
+const PORT        = parseInt(process.env.PORT) || 8082;
 const TARGET_HOST = 'internal-arlochat-mcp-alb-880426873.us-east-1.elb.amazonaws.com';
 const TARGET_PORT = 8080;
 
