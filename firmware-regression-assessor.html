@@ -511,7 +511,7 @@ class McpClient {
     this.onLog('SSE stream open', 'tool');
     this._readStream(resp.body);
     await new Promise((res, rej) => {
-      const t = setTimeout(() => rej(new Error('MCP endpoint timeout (10s) — is VPN on?')), 10000);
+      const t = setTimeout(() => rej(new Error('MCP endpoint timeout (30s) — is VPN on and proxy.js running?')), 30000);
       this._onEndpoint = url => { clearTimeout(t); this.sessionUrl = url; res(); };
     });
     await this._rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'fw-regression-assessor', version: '1.0' } });
