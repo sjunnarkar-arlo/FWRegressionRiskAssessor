@@ -446,12 +446,25 @@
         <input type="checkbox" id="use-mcp" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer" />
         <span style="font-family:var(--mono);font-size:12px;color:var(--text)">Direct Arlochat MCP<br><span style="color:var(--hint);font-size:10px">Requires VPN · no token needed</span></span>
       </label>
+      <div class="field" id="source-field" style="display:none;margin-top:4px">
+        <label>Commit source</label>
+        <select id="data-source">
+          <option value="github">GitHub commits</option>
+          <option value="email">Email release notes</option>
+        </select>
+      </div>
+      <div id="email-paste-field" style="display:none">
+        <div class="field">
+          <label>Paste release notes <span style="font-size:10px;color:var(--hint)">(fallback if auto-search fails)</span></label>
+          <textarea id="email-content" placeholder="Paste the release notes email body here…" style="background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:8px 10px;color:var(--text);font-family:var(--mono);font-size:11px;width:100%;height:90px;outline:none;resize:vertical;line-height:1.4"></textarea>
+        </div>
+      </div>
       <div class="field" style="margin-top:8px">
         <label>Anthropic key <span style="font-size:10px;color:var(--hint)">(optional — for AI analysis)</span></label>
         <input type="password" id="anthropic-key" placeholder="sk-ant-…" />
       </div>
       <div class="api-note">
-        <b style="color:var(--accent)">MCP on</b> → requires <code style="font-size:10px;color:var(--muted)">python proxy.py</code> + VPN. Fetches GitHub, Jira, Confluence + Zephyr via local proxy. Add Anthropic key for AI analysis, or leave blank for rule-based scoring.<br><br>
+        <b style="color:var(--accent)">MCP on</b> → requires <code style="font-size:10px;color:var(--muted)">python proxy.py</code> + VPN. Choose <b style="color:var(--text)">GitHub commits</b> or <b style="color:var(--text)">Email release notes</b> as your data source. Add Anthropic key for AI analysis, or leave blank for rule-based scoring.<br><br>
         <b style="color:var(--hint)">MCP off</b> → demo mode (no data fetching).<br><br>
         <a href="https://console.anthropic.com/settings/keys" target="_blank">Get Anthropic key ↗</a>
       </div>
@@ -871,6 +884,151 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
   return { repos_searched: candidates, refs_used: refsUsed, commits: allCommits };
 }
 
+// ── EMAIL RELEASE NOTES SOURCE ───────────────────────────
+function parseEmailResponse(raw) {
+  // Try JSON (double-quoted)
+  try { return JSON.parse(raw); } catch {}
+  // Try Python dict repr (single-quoted) — replace ' with " carefully
+  try {
+    const asJson = raw
+      .replace(/'/g, '"')
+      .replace(/\bTrue\b/g, 'true')
+      .replace(/\bFalse\b/g, 'false')
+      .replace(/\bNone\b/g, 'null');
+    return JSON.parse(asJson);
+  } catch {}
+  return null;
+}
+
+async function fetchReleaseNotesViaMcp(modelId, fwVersion, client) {
+  // If user pasted content, skip MCP entirely
+  const pastedContent = (document.getElementById('email-content')?.value || '').trim();
+  let emailBody = pastedContent;
+
+  if (!emailBody) {
+    const tools = await client.listTools();
+    const toolNames = tools.map(t => t.name);
+
+    const emailTool = tools.find(t =>
+      ['email', 'outlook', 'mail', 'inbox', 'message'].some(kw => t.name.toLowerCase().includes(kw))
+    );
+
+    if (!emailTool) {
+      throw new Error(`No email tool found in Arlochat MCP (available: ${toolNames.slice(0, 6).join(', ')}…). Paste the release note email body in the sidebar field.`);
+    }
+
+    log(`Using email tool: ${emailTool.name}`, 'info');
+
+    // Subject pattern: "[Name] Release Notes - [ModelID]-[FWVersion] - Release to QA"
+    const subjectHint = `${modelId}-${fwVersion}`;
+    const raw = await client.callTool(emailTool.name, {
+      query: `Release Notes ${subjectHint}`,
+      subject: `Release Notes - ${subjectHint}`,
+      search: `Release Notes ${subjectHint}`,
+      max_results: 50,
+      limit: 50
+    });
+
+    // Parse the response — it may be a JSON/Python-dict listing of emails
+    const parsed = parseEmailResponse(raw);
+    const emails = parsed?.emails || (Array.isArray(parsed) ? parsed : null);
+
+    if (emails) {
+      log(`Email tool returned ${emails.length} emails — scanning subjects for release notes…`, 'info');
+
+      const modelLower   = modelId.toLowerCase();
+      const versionLower = fwVersion.toLowerCase();
+
+      // Find the release notes email by subject
+      const match =
+        emails.find(e => {
+          const s = (e.subject || '').toLowerCase();
+          return s.includes('release notes') && s.includes(modelLower) && s.includes(versionLower);
+        }) ||
+        emails.find(e => {
+          const s = (e.subject || '').toLowerCase();
+          return s.includes('release notes') && (s.includes(modelLower) || s.includes(versionLower));
+        }) ||
+        emails.find(e => (e.subject || '').toLowerCase().includes('release notes'));
+
+      if (!match) {
+        const subjectList = emails.slice(0, 8).map(e => `  • ${e.subject || '(no subject)'}`).join('\n');
+        throw new Error(
+          `No release notes email matched "${subjectHint}" among ${emails.length} emails.\n\nSubjects found:\n${subjectList}\n\nPaste the email body in the sidebar field to continue.`
+        );
+      }
+
+      log(`Matched: "${match.subject}"`, 'success');
+
+      // Extract body — try common field names
+      emailBody = match.body || match.content || match.text ||
+        match.html_body || match.plain_body || match.body_preview ||
+        match.snippet || match.preview || '';
+
+      // If body is absent, try a separate read call using the email ID
+      if (!emailBody) {
+        const emailId = match.id || match.message_id || match.uid || match.email_id;
+        if (emailId) {
+          const readTool = tools.find(t =>
+            t.name.toLowerCase().includes('read') &&
+            ['email', 'mail', 'message'].some(kw => t.name.toLowerCase().includes(kw))
+          );
+          if (readTool) {
+            log(`Reading full body for email ${emailId}…`, 'tool');
+            emailBody = await client.callTool(readTool.name, { id: emailId, message_id: emailId, email_id: emailId });
+          }
+        }
+      }
+
+      // Last resort: use the subject line so at least ticket keys in the subject are captured
+      if (!emailBody) emailBody = match.subject || '';
+
+    } else {
+      // Tool returned plain text — use directly
+      emailBody = raw;
+    }
+
+    if (!emailBody || emailBody.trim().length < 20) {
+      throw new Error(`Found the email but couldn't read its body for ${modelId} ${fwVersion}. Paste the email body in the sidebar field.`);
+    }
+
+    log(`Email body ready: ${emailBody.length} chars`, 'success');
+  } else {
+    log(`Using pasted release notes: ${emailBody.length} chars`, 'success');
+  }
+
+  // Extract ticket keys line-by-line (same approach as commit path)
+  const keyPattern = /\b([A-Z][A-Z0-9]+-\d+)\b/g;
+  const seen = new Set();
+  const items = [];
+
+  for (const line of emailBody.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    keyPattern.lastIndex = 0;
+    const keys = [];
+    let m;
+    while ((m = keyPattern.exec(trimmed)) !== null) {
+      if (!seen.has(m[1])) seen.add(m[1]);
+      if (!keys.includes(m[1])) keys.push(m[1]);
+    }
+    if (keys.length) {
+      items.push({ sha: '—', msg: trimmed.slice(0, 200), repo: 'release-notes', keys });
+    }
+  }
+
+  if (!items.length) {
+    throw new Error(`No Jira ticket keys (e.g. PEGA-123) found in the release notes. Make sure the email contains ticket references.`);
+  }
+
+  return {
+    source: 'email',
+    commits: items,
+    repos_searched: ['email-release-notes'],
+    refs_used: { 'email-release-notes': 'release-notes' }
+  };
+}
+
 // ── DIRECT MCP: JIRA FULL READ ───────────────────────────
 async function fetchJiraDetailsViaMcp(ticketKeys, client) {
   if (!ticketKeys.length) return { tickets: [], fullDetails: '' };
@@ -1096,7 +1254,7 @@ Rules:
 }
 
 // ── RENDER ───────────────────────────────────────────────
-function renderResults(assessment, tickets, commitData, modelId, fwVersion, reposSearched, refsUsed) {
+function renderResults(assessment, tickets, commitData, modelId, fwVersion, reposSearched, refsUsed, sourceType = 'github') {
   const rC = assessment.overall_risk === 'HIGH' ? 'high' : assessment.overall_risk === 'MEDIUM' ? 'medium' : 'low';
   const projects = [...new Set(tickets.map(t => t.project))];
   const projColors = ['#00d4aa','#7a8fff','#f0a040','#ff7eb6','#a78bfa','#34d399'];
@@ -1165,7 +1323,7 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
           <div class="results-version">${fwVersion}</div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${repoStrip}</div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${projPills}</div>
-          <div class="results-meta" style="margin-top:6px">${commitData.length} commits · ${tickets.length} tickets · ${projects.length} project${projects.length!==1?'s':''} · ${new Date().toLocaleString()}</div>
+          <div class="results-meta" style="margin-top:6px">${commitData.length} ${sourceType === 'email' ? 'note items' : 'commits'} · ${tickets.length} tickets · ${projects.length} project${projects.length!==1?'s':''} · ${new Date().toLocaleString()}</div>
         </div>
         <div class="risk-badge badge-${rC}">
           <span class="risk-badge-label">risk score</span>
@@ -1178,7 +1336,7 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
 
       <div class="section">
         <div class="section-header">
-          <span class="section-title">Commits scanned</span>
+          <span class="section-title">${sourceType === 'email' ? 'Release note items' : 'Commits scanned'}</span>
           <span class="section-count">${commitData.length} with ticket refs</span>
         </div>
         <div style="font-family:var(--mono)">${commitStrip}</div>
@@ -1326,9 +1484,14 @@ async function runAssessment() {
 
   // ── DIRECT MCP MODE ───────────────────────────────────
   if (useMcp) {
+    const dataSource = document.getElementById('data-source').value;
+    const step1Label = dataSource === 'email'
+      ? `Email: release notes for ${modelId} ${fwVersion}`
+      : `GitHub: repos + commits for ${modelId}`;
+
     setLoading([
       'Connecting to Arlochat MCP',
-      `GitHub: repos + commits for ${modelId}`,
+      step1Label,
       'Jira: full ticket details',
       'Confluence + Zephyr: docs + test cycles',
       anthropicKey ? 'Claude AI risk analysis' : 'Rule-based risk analysis'
@@ -1343,9 +1506,12 @@ async function runAssessment() {
       await client.connect();
 
       activateStep(1);
-      const discovered = await discoverCommitsViaMcp(modelId, fwVersion, client);
+      const discovered = dataSource === 'email'
+        ? await fetchReleaseNotesViaMcp(modelId, fwVersion, client)
+        : await discoverCommitsViaMcp(modelId, fwVersion, client);
       const { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
-      if (!ticketKeys.length) throw new Error(`No ticket keys found in commits for ${modelId} ${fwVersion}.`);
+      const sourceLabel = dataSource === 'email' ? 'release notes' : 'commits';
+      if (!ticketKeys.length) throw new Error(`No ticket keys found in ${sourceLabel} for ${modelId} ${fwVersion}.`);
 
       activateStep(2);
       const { tickets, fullDetails } = await fetchJiraDetailsViaMcp(ticketKeys, client);
@@ -1363,7 +1529,7 @@ async function runAssessment() {
         ? await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, anthropicKey, { ticketFullDetails: fullDetails, confluenceContext, zephyrCycles })
         : ruleBasedAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used);
 
-      setTimeout(() => renderResults(assessment, tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used), 300);
+      setTimeout(() => renderResults(assessment, tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, dataSource), 300);
     } catch(e) {
       client.close();
       showError(e.message);
@@ -1377,6 +1543,18 @@ async function runAssessment() {
 
 ['model-id','fw-version'].forEach(id => {
   document.getElementById(id).addEventListener('keydown', e => { if (e.key === 'Enter') runAssessment(); });
+});
+
+document.getElementById('use-mcp').addEventListener('change', function() {
+  document.getElementById('source-field').style.display = this.checked ? 'block' : 'none';
+  if (!this.checked) {
+    document.getElementById('email-paste-field').style.display = 'none';
+    document.getElementById('data-source').value = 'github';
+  }
+});
+
+document.getElementById('data-source').addEventListener('change', function() {
+  document.getElementById('email-paste-field').style.display = this.value === 'email' ? 'block' : 'none';
 });
 
 </script>

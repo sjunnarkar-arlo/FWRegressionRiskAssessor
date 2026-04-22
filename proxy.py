@@ -87,14 +87,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         current_event = ''
         try:
-            for raw in upstream.iter_lines(chunk_size=1, decode_unicode=True, keepends=True):
+            for raw in upstream.iter_lines(chunk_size=1, decode_unicode=True):
                 if raw is None:
                     continue
                 line = raw if isinstance(raw, str) else raw.decode('utf-8')
 
                 if line.startswith('event:'):
                     current_event = line[6:].strip()
-                    self.wfile.write(line.encode('utf-8'))
+                    self.wfile.write((line + '\n').encode('utf-8'))
 
                 elif line.startswith('data:') and current_event == 'endpoint':
                     data = line[5:].strip()
@@ -104,11 +104,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     current_event = ''
 
                 else:
-                    self.wfile.write(line.encode('utf-8'))
+                    self.wfile.write((line + '\n').encode('utf-8'))
 
                 self.wfile.flush()
 
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
         except Exception as e:
             print('[proxy] SSE stream error: ' + str(e), flush=True)
@@ -120,14 +120,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         body = self.rfile.read(length) if length else b''
         print('[proxy] POST -> ' + url, flush=True)
         try:
-            r = requests.post(url, data=body, headers={'Content-Type': 'application/json'}, timeout=30)
+            r = requests.post(url, data=body, headers={'Content-Type': 'application/json'}, timeout=120)
             self.send_response(r.status_code)
             self._cors()
             self.end_headers()
             self.wfile.write(r.content)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass  # browser closed the connection before we could respond
         except Exception as e:
             print('[proxy] POST error: ' + str(e), flush=True)
-            self.send_error(502, str(e))
+            try:
+                self.send_error(502, str(e))
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
 
 
 class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
