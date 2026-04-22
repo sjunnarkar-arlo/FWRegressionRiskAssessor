@@ -412,6 +412,25 @@
   .run-regression { color: var(--r-med); border-color: var(--r-med-border); background: var(--r-med-bg); }
   .run-smoke { color: var(--r-low); border-color: var(--r-low-border); background: var(--r-low-bg); }
 
+  /* Execution report */
+  .exec-stats { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .exec-stat { display: flex; flex-direction: column; align-items: center; padding: 10px 18px; border-radius: 8px; border: 1px solid var(--border2); background: var(--bg3); min-width: 70px; }
+  .exec-stat-num { font-family: var(--mono); font-size: 22px; font-weight: 700; line-height: 1; }
+  .exec-stat-label { font-family: var(--mono); font-size: 10px; color: var(--hint); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .exec-stat.pass  .exec-stat-num { color: var(--r-low); }
+  .exec-stat.fail  .exec-stat-num { color: var(--r-high); }
+  .exec-stat.block .exec-stat-num { color: var(--r-med); }
+  .exec-stat.total .exec-stat-num { color: var(--text); }
+  .exec-area-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+  .exec-area { padding: 12px 14px; border-radius: 8px; border: 1px solid; }
+  .exec-area.troubled { border-color: var(--r-high-border); background: var(--r-high-bg); }
+  .exec-area.safe     { border-color: var(--r-low-border);  background: var(--r-low-bg); }
+  .exec-area-name { font-family: var(--mono); font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+  .exec-area.troubled .exec-area-name { color: var(--r-high); }
+  .exec-area.safe     .exec-area-name { color: var(--r-low); }
+  .exec-area-verdict { font-size: 12px; color: var(--muted); line-height: 1.4; }
+  .exec-area-meta { font-family: var(--mono); font-size: 10px; color: var(--hint); margin-top: 6px; line-height: 1.5; }
+
   /* Scrollbar */
   ::-webkit-scrollbar { width: 5px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -444,6 +463,8 @@
           <option value="github">GitHub commits</option>
           <option value="email">Email release notes</option>
         </select>
+        <label style="margin-top:8px">Zephyr project key <span style="font-size:10px;color:var(--hint)">(optional · e.g. PEGA or PEGA, AWY)</span></label>
+        <input type="text" id="zephyr-project-key" placeholder="auto-detected from tickets" style="font-size:11px;margin-top:4px" />
       </div>
       <div class="field" id="ms-auth-field" style="display:none">
         <label>Azure App Client ID</label>
@@ -1243,95 +1264,184 @@ async function fetchConfluenceContextViaMcp(modelId, client) {
   return context;
 }
 
-// ── DIRECT MCP: ZEPHYR TEST CYCLES ───────────────────────
-async function fetchZephyrTestCyclesViaMcp(projectKey, modelId, client) {
+// ── DIRECT MCP: ZEPHYR TEST CYCLES + EXECUTION RESULTS ───
+async function fetchZephyrTestCyclesViaMcp(projectKeys, modelId, fwVersion, client) {
   const tools = await client.listTools();
-  const listTool    = tools.find(t => t.name === 'zephyr_list')?.name;
+
+  // Flexible tool discovery: exact name first, then any tool with 'zephyr' in name
+  const listTool = (
+    tools.find(t => t.name === 'zephyr_list') ||
+    tools.find(t => t.name.toLowerCase().includes('zephyr') && t.name.toLowerCase().includes('list')) ||
+    tools.find(t => t.name.toLowerCase().startsWith('zephyr'))
+  )?.name;
+
+  if (!listTool) {
+    log(`No Zephyr tool found. Available: ${tools.map(t => t.name).join(', ')}`, 'info');
+    return '';
+  }
+  log(`Zephyr tool: ${listTool}`, 'info');
+
   const getExecTool = tools.find(t => t.name === 'zephyr_get_executions')?.name;
-  const getCaseTool = tools.find(t => t.name === 'zephyr_get_test_case')?.name;
-  if (!listTool) { log('zephyr_list not available', 'info'); return ''; }
+
+  // Strip build hash: "0.100.159_b075390" → "0.100.159"
+  const baseVersion = fwVersion.replace(/_[a-f0-9]{6,}$/i, '').replace(/_b\d+$/i, '');
+  const keys = Array.isArray(projectKeys) ? projectKeys : [projectKeys];
+
+  // Helper: count execution statuses from raw text
+  function parseExecCounts(raw) {
+    const upper = raw.toUpperCase();
+    const count = (kws) => kws.reduce((n, kw) => {
+      return n + (upper.match(new RegExp(`"status"\\s*:\\s*"${kw}"`, 'g')) || []).length;
+    }, 0);
+    return {
+      passed:  count(['PASS', 'PASSED']),
+      failed:  count(['FAIL', 'FAILED']),
+      blocked: count(['BLOCKED', 'BLOCK']),
+    };
+  }
 
   const sections = [];
+  const execSummaryLines = [];    // one line per cycle with pass/fail counts
+  let totalPassed = 0, totalFailed = 0, totalBlocked = 0;
 
-  // Step 1: List folders — find the template folder for this device
-  log(`Finding Zephyr template folder for ${projectKey} (${modelId})…`, 'tool');
-  let templateFolderId = null;
-  try {
-    const foldersRaw = await client.callTool(listTool, { type: 'folders', project_key: projectKey });
-    sections.push(`=== ZEPHYR FOLDERS (${projectKey}) ===\n${foldersRaw}`);
-    log(`Folders: ${foldersRaw.slice(0, 300)}`, 'info');
-
-    // Try to find a folder whose name contains "template", the model ID, or "regression"
-    const keywords = ['template', modelId?.toLowerCase(), 'regression template'];
-    // JSON response: try {"id":...,"name":"..."} in either order
-    const folderEntries = [...foldersRaw.matchAll(/\{[^}]+\}/g)].map(m => m[0]);
-    for (const entry of folderEntries) {
-      const nameMatch = entry.match(/"name"\s*:\s*"([^"]+)"/i);
-      const idMatch   = entry.match(/"id"\s*:\s*"?(-?\d+)"?/i);
-      if (nameMatch && idMatch && keywords.some(k => k && nameMatch[1].toLowerCase().includes(k))) {
-        templateFolderId = idMatch[1];
-        log(`Template folder: "${nameMatch[1]}" (id ${templateFolderId})`, 'success');
-        break;
-      }
-    }
-    if (!templateFolderId) log('No template folder matched — will list all cycles', 'info');
-  } catch (e) {
-    log(`Folder listing failed: ${e.message}`, 'info');
-  }
-
-  // Step 2: List cycles (scoped to template folder when found)
-  log(`Listing cycles in ${projectKey}${templateFolderId ? ' template folder' : ''}…`, 'tool');
-  const cycleParams = { type: 'cycles', project_key: projectKey, max_results: 60 };
-  if (templateFolderId) cycleParams.folder_id = templateFolderId;
-  const cyclesRaw = await client.callTool(listTool, cycleParams);
-  sections.push(`=== TEST CYCLES — ${projectKey}${templateFolderId ? ' (template folder)' : ''} ===\n${cyclesRaw}`);
-  log(`Cycles raw: ${cyclesRaw.length} chars`, 'success');
-
-  // Step 3: Extract cycle IDs and read test cases for each cycle
-  // IDs appear as "id": 123 or "id": "-1" (skip -1, it's the unversioned bucket)
-  const cycleIds = [...cyclesRaw.matchAll(/"id"\s*:\s*"?(-?\d+)"?/g)]
-    .map(m => m[1])
-    .filter(id => id !== '-1' && id !== 'null')
-    .filter((v, i, a) => a.indexOf(v) === i) // deduplicate
-    .slice(0, 10);
-
-  if (!cycleIds.length) {
-    log('No cycle IDs found in Zephyr response', 'info');
-    return sections.join('\n\n');
-  }
-
-  log(`Reading test cases for ${cycleIds.length} cycles…`, 'tool');
-  for (const cycleId of cycleIds) {
+  for (const projectKey of keys) {
+    // Step 1: Find template folder for this device/model
+    log(`Finding Zephyr folder for ${projectKey} (${modelId})…`, 'tool');
+    let folderId = null;
     try {
-      // Try zephyr_get_executions first (returns test cases in the cycle)
-      if (getExecTool) {
-        const execRaw = await client.callTool(getExecTool, {
-          cycle_id: cycleId, project_key: projectKey, max_results: 30
-        });
-        if (execRaw && execRaw.trim().length > 10) {
-          sections.push(`=== CYCLE ${cycleId} — EXECUTIONS ===\n${execRaw.slice(0, 2000)}`);
-          continue;
+      const foldersRaw = await client.callTool(listTool, { type: 'folders', project_key: projectKey });
+      const keywords = ['template', modelId?.toLowerCase(), 'regression'];
+      const folderEntries = [...foldersRaw.matchAll(/\{[^}]+\}/g)].map(m => m[0]);
+      for (const entry of folderEntries) {
+        const nameM = entry.match(/"name"\s*:\s*"([^"]+)"/i);
+        const idM   = entry.match(/"id"\s*:\s*"?(-?\d+)"?/i);
+        if (nameM && idM && keywords.some(k => k && nameM[1].toLowerCase().includes(k))) {
+          folderId = idM[1];
+          log(`Folder: "${nameM[1]}" (id ${folderId})`, 'success');
+          break;
         }
       }
-      // Fallback: zephyr_list type=test_cases for the cycle
-      const tcRaw = await client.callTool(listTool, {
-        type: 'test_cases', cycle_id: cycleId, project_key: projectKey, max_results: 30
-      });
-      if (tcRaw && tcRaw.trim().length > 10)
-        sections.push(`=== CYCLE ${cycleId} — TEST CASES ===\n${tcRaw.slice(0, 2000)}`);
+      if (!folderId) log(`No template folder matched for ${projectKey} — listing all cycles`, 'info');
     } catch (e) {
-      log(`Cycle ${cycleId} read failed: ${e.message}`, 'info');
+      log(`Folder listing failed for ${projectKey}: ${e.message}`, 'info');
+    }
+
+    // Step 2: List cycles — try version-scoped first, then all
+    log(`Listing cycles for ${projectKey}${folderId ? ' (template folder)' : ''}…`, 'tool');
+    let cyclesRaw = '';
+    const cycleParamsBase = { type: 'cycles', project_key: projectKey, max_results: 60 };
+    if (folderId) cycleParamsBase.folder_id = folderId;
+
+    // Try with version filter first
+    try {
+      cyclesRaw = await client.callTool(listTool, { ...cycleParamsBase, version: baseVersion });
+    } catch (_) {}
+
+    // Fallback: all cycles, then filter client-side by name containing version
+    if (!cyclesRaw || cyclesRaw.trim().length < 20) {
+      try {
+        cyclesRaw = await client.callTool(listTool, cycleParamsBase);
+      } catch (e) {
+        log(`Cycles call failed for ${projectKey}: ${e.message}`, 'info');
+        continue;
+      }
+    }
+
+    if (!cyclesRaw || cyclesRaw.trim().length < 10) {
+      log(`No cycles returned for ${projectKey}`, 'info');
+      continue;
+    }
+
+    sections.push(`=== TEST CYCLES — ${projectKey} ===\n${cyclesRaw}`);
+    log(`Cycles: ${cyclesRaw.length} chars`, 'success');
+
+    // Step 3: Extract cycle IDs — prefer cycles whose name contains the version
+    const allIds = [...cyclesRaw.matchAll(/"id"\s*:\s*"?(-?\d+)"?/g)]
+      .map(m => m[1])
+      .filter(id => id !== '-1' && id !== 'null')
+      .filter((v, i, a) => a.indexOf(v) === i);
+
+    // Try to extract cycle names alongside IDs to prefer version-matching ones
+    let relevantIds = allIds;
+    try {
+      const cycleObjects = [...cyclesRaw.matchAll(/\{[^{}]{10,500}\}/g)].map(m => m[0]);
+      const versionLower = baseVersion.toLowerCase();
+      const modelLower   = modelId.toLowerCase();
+      const versionIds = cycleObjects
+        .filter(o => {
+          const nameM = o.match(/"name"\s*:\s*"([^"]+)"/i);
+          if (!nameM) return false;
+          const n = nameM[1].toLowerCase();
+          return n.includes(versionLower) || n.includes(modelLower);
+        })
+        .map(o => (o.match(/"id"\s*:\s*"?(-?\d+)"?/i) || [])[1])
+        .filter(Boolean);
+      if (versionIds.length) {
+        log(`Found ${versionIds.length} cycle(s) matching version/model — using those`, 'info');
+        relevantIds = versionIds;
+      }
+    } catch (_) {}
+
+    const cycleIds = relevantIds.slice(0, 10);
+    if (!cycleIds.length) {
+      log(`No cycle IDs found in ${projectKey}`, 'info');
+      continue;
+    }
+
+    // Step 4: Read executions per cycle → collect pass/fail/blocked
+    log(`Reading executions for ${cycleIds.length} cycle(s)…`, 'tool');
+    for (const cycleId of cycleIds) {
+      try {
+        let execRaw = '';
+
+        if (getExecTool) {
+          execRaw = await client.callTool(getExecTool, {
+            cycle_id: cycleId, project_key: projectKey, max_results: 50
+          }).catch(() => '');
+        }
+        if (!execRaw || execRaw.trim().length < 10) {
+          execRaw = await client.callTool(listTool, {
+            type: 'test_cases', cycle_id: cycleId, project_key: projectKey, max_results: 50
+          }).catch(() => '');
+        }
+
+        if (execRaw && execRaw.trim().length > 10) {
+          const counts = parseExecCounts(execRaw);
+          totalPassed  += counts.passed;
+          totalFailed  += counts.failed;
+          totalBlocked += counts.blocked;
+
+          const total = counts.passed + counts.failed + counts.blocked;
+          const statusLine = total
+            ? `PASSED: ${counts.passed}, FAILED: ${counts.failed}, BLOCKED: ${counts.blocked}`
+            : 'no status data';
+
+          // Extract cycle name from cycles listing for readable summary
+          const nameInCycles = (cyclesRaw.match(new RegExp(`"id"\\s*:\\s*"?${cycleId}"?[^}]*"name"\\s*:\\s*"([^"]+)"`, 'i')) ||
+                                cyclesRaw.match(new RegExp(`"name"\\s*:\\s*"([^"]+)"[^}]*"id"\\s*:\\s*"?${cycleId}"?`, 'i')))?.[1] || `Cycle ${cycleId}`;
+          execSummaryLines.push(`  ${nameInCycles}: ${statusLine}`);
+
+          sections.push(`=== CYCLE ${cycleId} (${nameInCycles}) — EXECUTIONS ===\n${execRaw.slice(0, 2500)}`);
+        }
+      } catch (e) {
+        log(`Cycle ${cycleId} read failed: ${e.message}`, 'info');
+      }
     }
   }
 
-  return sections.join('\n\n');
+  if (!sections.length) {
+    log('No Zephyr data retrieved — check project key and VPN', 'info');
+    return '';
+  }
+
+  const hasExec = execSummaryLines.length > 0;
+  log(`Zephyr: ${sections.length} section(s)${hasExec ? ` | Pass:${totalPassed} Fail:${totalFailed} Block:${totalBlocked}` : ''}`, 'info');
+
+  const execSummary = hasExec ? `\n=== EXECUTION SUMMARY ===\nTotal across all cycles — PASSED: ${totalPassed}, FAILED: ${totalFailed}, BLOCKED: ${totalBlocked}\nPer cycle:\n${execSummaryLines.join('\n')}\n` : '';
+
+  return sections.join('\n\n') + execSummary;
 }
 
-function primaryProject(ticketKeys) {
-  const counts = {};
-  ticketKeys.forEach(k => { const p = k.replace(/-\d+$/, ''); counts[p] = (counts[p]||0) + 1; });
-  return Object.entries(counts).sort((a,b) => b[1]-a[1])[0]?.[0] || 'PEGA';
-}
 
 // ── RULE-BASED RISK ASSESSMENT ───────────────────────────
 function ruleBasedAssess(tickets, commitData, modelId, fwVersion, reposSearched, refsUsed) {
@@ -1445,7 +1555,8 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
     return `- ${t.key} [${t.priority}]: ${t.summary}${msgs ? `\n  commits: ${msgs}` : ''}`;
   }).join('\n');
 
-  const hasZephyr = zephyrCycles.trim().length > 0;
+  const hasZephyr     = zephyrCycles.trim().length > 0;
+  const hasExecutions = zephyrCycles.includes('=== EXECUTION SUMMARY ===');
 
   const prompt = `You are a senior firmware QA engineer at Arlo. Analyze the firmware release for model "${modelId}" version "${fwVersion}" (repos: ${repoSummary}).
 
@@ -1453,40 +1564,54 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
 ${ticketFullDetails || ticketList}
 
 ${confluenceContext ? `## CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 2000)}\n` : ''}
-${hasZephyr ? `## ZEPHYR TEMPLATE FOLDER — TEST CYCLES & TEST CASES\nThe following data comes from the Zephyr template folder for this device's project. It includes cycle names and the test cases inside each cycle.\n\n${zephyrCycles.slice(0, 6000)}\n` : ''}
+${hasZephyr ? `## ZEPHYR TEST CYCLES & EXECUTION RESULTS\nThe following data includes test cycles, test cases, and actual execution results (pass/fail/blocked) for this FW version.\n\n${zephyrCycles.slice(0, 7000)}\n` : ''}
 
 Your task:
 1. For each ticket, identify which functional area it affects (e.g. BLE Onboarding, OTA/FOTA, Wi-Fi, Audio, Streaming, Camera Pipeline, MCU/RTOS, Storage, Doorbell, etc.).
 2. ${hasZephyr
-  ? 'Cross-reference those functional areas against the Zephyr template cycles above. Read the test cases listed under each cycle to understand what it actually covers. Then recommend which cycles from the template folder should be executed for this release, ranked by priority. Use the EXACT cycle names from the Zephyr data — do not invent cycle names.'
+  ? hasExecutions
+    ? 'Analyze the Zephyr execution results: for each functional area determine whether it is "troubled" (tests FAILED or BLOCKED, and/or open high-priority tickets) or "safe" (all tests PASSED and related tickets are resolved). Recommend which cycles to re-run or focus on, using EXACT cycle names from the data.'
+    : 'Cross-reference those functional areas against the Zephyr cycles above. Recommend which specific cycles to execute for this release, ranked by priority. Use EXACT cycle names from the Zephyr data.'
   : 'Based on the impacted functional areas, recommend which test cycles should be executed. Use concrete cycle names matching the affected areas (e.g. "BLE Onboarding Regression", "FOTA Regression", "Streaming & 2-Way Talk", "Audio Regression", "Factory Reset", "Sleep/Wakeup Soak", etc.).'}
-3. Assess subsystem risk based on what actually changed.
+3. Assess subsystem risk based on what actually changed${hasExecutions ? ' and what the execution results reveal' : ''}.
 
 Return ONLY valid JSON (no markdown fences):
 {
   "overall_risk": "HIGH"|"MEDIUM"|"LOW",
   "risk_score": <1-100>,
-  "summary": "<2-3 sentences: overall risk, blast radius, any cross-project concerns>",
+  "summary": "<2-3 sentences: overall risk, blast radius${hasExecutions ? ', and what execution results show' : ''}>",
   "subsystems": [
     {"name":"<subsystem>","risk":"HIGH"|"MEDIUM"|"LOW","reason":"<max 12 words>","tickets":["KEY-1"]}
-  ],
+  ],${hasExecutions ? `
+  "execution_report": {
+    "cycles_analyzed": <number>,
+    "total_tests": <number>,
+    "passed": <number>,
+    "failed": <number>,
+    "blocked": <number>,
+    "troubled_areas": [
+      {"area":"<subsystem>","failing_tests":["<test name>"],"related_tickets":["KEY-1"],"verdict":"<1 sentence why risky>"}
+    ],
+    "safe_areas": [
+      {"area":"<subsystem>","passing_tests":["<test name>"],"related_tickets":["KEY-1"],"verdict":"<1 sentence why safe>"}
+    ]
+  },` : ''}
   "test_cycle_recommendations": [
-    {"priority":"P1"|"P2"|"P3","cycle":"<${hasZephyr ? 'EXACT cycle name from Zephyr template folder' : 'cycle name for the impacted area'}>","reason":"<which ticket/change drives this, max 15 words>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
+    {"priority":"P1"|"P2"|"P3","cycle":"<${hasZephyr ? 'EXACT cycle name from Zephyr data' : 'cycle name for the impacted area'}>","reason":"<which ticket/change drives this, max 15 words>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
   ],
   "key_advice": "<3-4 sentences of specific QA guidance for this exact release>"
 }
 
 Rules:
-- subsystems: 4-8 items, risk DESC. Real names: Wi-Fi Stack, BLE Onboarding FSM, NIM Layer, OTA Manager, Power Manager, MCU/RTOS, LED Controller, Camera Pipeline, Audio Subsystem, Storage/UBI, Motion Detection, ERPC Layer.
-- test_cycle_recommendations: ${hasZephyr
-  ? 'ONLY recommend cycles that exist in the Zephyr template folder data above — use their exact names. Exclude cycles whose test cases have no overlap with the changes. P1 = directly touched area, P2 = shared dependency risk, P3 = broad regression safety net.'
-  : '6-12 items covering all impacted functional areas. Every P1 cycle must cite at least one ticket.'} P1 first. run_type: "full" for high-risk areas, "smoke" for low-risk, "regression" for medium.
+- subsystems: 4-8 items, risk DESC. Real names: Wi-Fi Stack, BLE Onboarding FSM, NIM Layer, OTA Manager, Power Manager, MCU/RTOS, LED Controller, Camera Pipeline, Audio Subsystem, Storage/UBI, Motion Detection, ERPC Layer.${hasExecutions ? `
+- execution_report.troubled_areas: areas with FAILED/BLOCKED tests OR open high-priority tickets. safe_areas: areas where all tests PASSED AND related tickets are resolved.` : ''}
+- test_cycle_recommendations: ${hasZephyr ? 'ONLY use cycle names that appear in the Zephyr data above. P1 = directly touched area, P2 = shared dependency, P3 = regression safety net.' : '6-12 items covering all impacted areas. Every P1 must cite at least one ticket.'} P1 first. run_type: "full" for high-risk, "smoke" for low-risk, "regression" for medium.
 - Cross-project shared-code changes push risk_score higher.`;
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 6000, messages: [{ role: 'user', content: prompt }] })
   });
   if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.error?.message || `Claude error ${resp.status}`); }
   const data = await resp.json();
@@ -1563,6 +1688,19 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
       <div class="summary-banner ${rC}">${assessment.summary}</div>
 
       <div class="section">
+        <div class="section-header"><span class="section-title">QA advice</span></div>
+        <div class="advice-box"><p>${assessment.key_advice}</p></div>
+      </div>
+
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">Subsystems at risk</span>
+          <span class="section-count">${(assessment.subsystems||[]).length}</span>
+        </div>
+        <div class="sub-grid">${subCards}</div>
+      </div>
+
+      <div class="section">
         <div class="section-header">
           <span class="section-title">${sourceType === 'email' ? 'Release note items' : 'Commits scanned'}</span>
           <span class="section-count">${commitData.length} with ticket refs</span>
@@ -1578,13 +1716,43 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
         <div class="ticket-list">${ticketRows}</div>
       </div>
 
-      <div class="section">
-        <div class="section-header">
-          <span class="section-title">Subsystems at risk</span>
-          <span class="section-count">${(assessment.subsystems||[]).length}</span>
-        </div>
-        <div class="sub-grid">${subCards}</div>
-      </div>
+      ${assessment.execution_report ? (() => {
+        const er = assessment.execution_report;
+        const troubled = er.troubled_areas || [];
+        const safe     = er.safe_areas     || [];
+        const statsHtml = (er.total_tests != null) ? `
+          <div class="exec-stats">
+            ${er.total_tests != null ? `<div class="exec-stat total"><span class="exec-stat-num">${er.total_tests}</span><span class="exec-stat-label">Total</span></div>` : ''}
+            ${er.passed      != null ? `<div class="exec-stat pass"><span class="exec-stat-num">${er.passed}</span><span class="exec-stat-label">Passed</span></div>` : ''}
+            ${er.failed      != null ? `<div class="exec-stat fail"><span class="exec-stat-num">${er.failed}</span><span class="exec-stat-label">Failed</span></div>` : ''}
+            ${er.blocked     != null ? `<div class="exec-stat block"><span class="exec-stat-num">${er.blocked}</span><span class="exec-stat-label">Blocked</span></div>` : ''}
+          </div>` : '';
+        const areaCards = [
+          ...troubled.map(a => `
+            <div class="exec-area troubled">
+              <div class="exec-area-name">⚠ ${a.area}</div>
+              <div class="exec-area-verdict">${a.verdict}</div>
+              ${a.failing_tests?.length  ? `<div class="exec-area-meta">Tests: ${a.failing_tests.slice(0,4).join(', ')}</div>` : ''}
+              ${a.related_tickets?.length ? `<div class="exec-area-meta">Tickets: ${a.related_tickets.join(', ')}</div>` : ''}
+            </div>`),
+          ...safe.map(a => `
+            <div class="exec-area safe">
+              <div class="exec-area-name">✓ ${a.area}</div>
+              <div class="exec-area-verdict">${a.verdict}</div>
+              ${a.passing_tests?.length   ? `<div class="exec-area-meta">Tests: ${a.passing_tests.slice(0,4).join(', ')}</div>` : ''}
+              ${a.related_tickets?.length ? `<div class="exec-area-meta">Tickets: ${a.related_tickets.join(', ')}</div>` : ''}
+            </div>`)
+        ].join('');
+        return `
+        <div class="section">
+          <div class="section-header">
+            <span class="section-title">Execution report</span>
+            <span class="section-count">${er.cycles_analyzed || '?'} cycles · ${troubled.length} troubled · ${safe.length} safe</span>
+          </div>
+          ${statsHtml}
+          <div class="exec-area-grid">${areaCards}</div>
+        </div>`;
+      })() : ''}
 
       <div class="section">
         <div class="section-header">
@@ -1611,10 +1779,6 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
         </table>` : '<div style="padding:12px;color:var(--hint);font-size:12px">No test cycle recommendations generated.</div>'}
       </div>
 
-      <div class="section">
-        <div class="section-header"><span class="section-title">QA advice</span></div>
-        <div class="advice-box"><p>${assessment.key_advice}</p></div>
-      </div>
     </div>`;
 }
 
@@ -1739,10 +1903,15 @@ async function runAssessment() {
       const { tickets, fullDetails } = await fetchJiraDetailsViaMcp(ticketKeys, client);
 
       activateStep(3);
-      const projKey = primaryProject(ticketKeys);
+      // Use manual Zephyr project key override if provided, else all unique Jira prefixes
+      const zephyrKeyInput = (document.getElementById('zephyr-project-key')?.value || '').trim();
+      const zephyrKeys = zephyrKeyInput
+        ? zephyrKeyInput.split(/[,;\s]+/).map(k => k.trim().toUpperCase()).filter(Boolean)
+        : [...new Set(ticketKeys.map(k => k.replace(/-\d+$/, '')))];
+      log(`Zephyr project key(s): ${zephyrKeys.join(', ')}`, 'info');
       const [confluenceContext, zephyrCycles] = await Promise.all([
-        fetchConfluenceContextViaMcp(modelId, client).catch(() => ''),
-        fetchZephyrTestCyclesViaMcp(projKey, modelId, client).catch(() => '')
+        fetchConfluenceContextViaMcp(modelId, client).catch(e => { log(`Confluence failed: ${e.message}`, 'info'); return ''; }),
+        fetchZephyrTestCyclesViaMcp(zephyrKeys, modelId, fwVersion, client).catch(e => { log(`Zephyr failed: ${e.message}`, 'info'); return ''; })
       ]);
       log(`Confluence: ${confluenceContext.length} chars | Zephyr: ${zephyrCycles.length} chars`, 'info');
 
