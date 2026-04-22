@@ -461,7 +461,15 @@
       </div>
       <div id="email-paste-field" style="display:none">
         <div class="field">
-          <label>Paste release notes <span style="font-size:10px;color:var(--hint)">(fallback if search fails)</span></label>
+          <label>Attach file <span style="font-size:10px;color:var(--hint)">(.eml .msg .txt)</span></label>
+          <label id="file-drop-zone" style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg3);border:1px dashed var(--border2);border-radius:6px;cursor:pointer;transition:border-color 0.15s" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border2)'">
+            <span style="font-size:14px">📎</span>
+            <span id="file-attach-name" style="font-family:var(--mono);font-size:11px;color:var(--hint)">Choose file or drag &amp; drop…</span>
+            <input type="file" id="release-notes-file" accept=".eml,.msg,.txt,.html" style="display:none" />
+          </label>
+        </div>
+        <div class="field" style="margin-top:4px">
+          <label>Or paste release notes <span style="font-size:10px;color:var(--hint)">(fallback)</span></label>
           <textarea id="email-content" placeholder="Paste the release notes email body here…" style="background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:8px 10px;color:var(--text);font-family:var(--mono);font-size:11px;width:100%;height:80px;outline:none;resize:vertical;line-height:1.4"></textarea>
         </div>
       </div>
@@ -840,7 +848,7 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
 
   // Find all repos in org
   const repoRaw = await client.callTool(ghTool, {
-    command: `gh repo list arlo-engineering --limit 200 --json name --jq '[.[].name]'`
+    command: `repo list arlo-engineering --limit 200 --json name --jq '[.[].name]'`
   });
   let allRepoNames = [];
   try { allRepoNames = JSON.parse(repoRaw); } catch {}
@@ -860,14 +868,14 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
 
   for (const repo of candidates) {
     // Find ref matching fwVersion
-    const tagsRaw = await client.callTool(ghTool, { command: `gh api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
+    const tagsRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
     let ref = 'master';
     try {
       const tags = JSON.parse(tagsRaw);
       const match = tags.find(t => t.includes(fwVersion) || fwVersion.includes(t.replace(/^v/, '')));
       if (match) { ref = match; }
       else {
-        const brRaw = await client.callTool(ghTool, { command: `gh api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
+        const brRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
         const branches = JSON.parse(brRaw || '[]');
         const bMatch = branches.find(b => b.includes(fwVersion)) || branches.find(b => b.includes('release'));
         if (bMatch) ref = bMatch;
@@ -875,7 +883,7 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
     } catch {}
 
     const commitsRaw = await client.callTool(ghTool, {
-      command: `gh api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
+      command: `api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
     });
     try {
       const parsed = JSON.parse(commitsRaw);
@@ -1661,6 +1669,55 @@ document.getElementById('data-source').addEventListener('change', function() {
   const isEmail = this.value === 'email';
   document.getElementById('ms-auth-field').style.display = isEmail ? 'block' : 'none';
   document.getElementById('email-paste-field').style.display = isEmail ? 'block' : 'none';
+});
+
+// File input: read .eml/.txt into textarea; warn on .msg
+document.getElementById('release-notes-file').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const nameEl = document.getElementById('file-attach-name');
+  nameEl.textContent = file.name;
+  nameEl.style.color = 'var(--accent)';
+
+  if (file.name.toLowerCase().endsWith('.msg')) {
+    document.getElementById('email-content').placeholder =
+      '.msg (Outlook binary) cannot be read as text. Export as .eml or copy-paste the body below.';
+    return;
+  }
+
+  const reader = new FileReader();
+  reader.onload = function(ev) {
+    let content = ev.target.result;
+    if (file.name.toLowerCase().endsWith('.eml')) {
+      const crlf = content.indexOf('\r\n\r\n');
+      const lf   = content.indexOf('\n\n');
+      const sep  = crlf !== -1 ? crlf + 4 : lf !== -1 ? lf + 2 : 0;
+      content = content.slice(sep);
+    }
+    document.getElementById('email-content').value = content;
+  };
+  reader.readAsText(file);
+});
+
+// Drag-and-drop on the drop-zone label
+const dropZone = document.getElementById('file-drop-zone');
+dropZone.addEventListener('dragover', function(e) {
+  e.preventDefault();
+  this.style.borderColor = 'var(--accent)';
+});
+dropZone.addEventListener('dragleave', function() {
+  this.style.borderColor = 'var(--border2)';
+});
+dropZone.addEventListener('drop', function(e) {
+  e.preventDefault();
+  this.style.borderColor = 'var(--border2)';
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  const input = document.getElementById('release-notes-file');
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  input.files = dt.files;
+  input.dispatchEvent(new Event('change'));
 });
 
 </script>
