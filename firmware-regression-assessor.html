@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>FW Regression Risk Assessor</title>
-<script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2/lib/msal-browser.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
 
@@ -1047,6 +1047,7 @@ function getMsalInstance(clientId) {
 }
 
 async function acquireMsToken(clientId) {
+  if (typeof msal === 'undefined') throw new Error('MSAL library failed to load — check your internet connection and reload the page.');
   if (_msAccessToken) return _msAccessToken;
   const instance = getMsalInstance(clientId);
   const scopes = ['https://graph.microsoft.com/Mail.Read'];
