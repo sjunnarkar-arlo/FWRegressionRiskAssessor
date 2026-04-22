@@ -1,0 +1,1384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FW Regression Risk Assessor</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0d0f0f;
+    --bg2:      #141717;
+    --bg3:      #1a1e1e;
+    --bg4:      #202525;
+    --border:   rgba(255,255,255,0.07);
+    --border2:  rgba(255,255,255,0.13);
+    --text:     #e8eeee;
+    --muted:    #7a9090;
+    --hint:     #4a6060;
+    --accent:   #00d4aa;
+    --accent2:  #00a882;
+    --mono:     'IBM Plex Mono', monospace;
+    --sans:     'IBM Plex Sans', sans-serif;
+    --r-high:   #ff5f5f;
+    --r-high-bg: rgba(255,95,95,0.1);
+    --r-high-border: rgba(255,95,95,0.3);
+    --r-med:    #f0a040;
+    --r-med-bg: rgba(240,160,64,0.1);
+    --r-med-border: rgba(240,160,64,0.3);
+    --r-low:    #00d4aa;
+    --r-low-bg: rgba(0,212,170,0.08);
+    --r-low-border: rgba(0,212,170,0.25);
+  }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    min-height: 100vh;
+    line-height: 1.6;
+  }
+
+  /* --- LAYOUT --- */
+  .app { display: grid; grid-template-columns: 280px 1fr; min-height: 100vh; }
+
+  /* --- SIDEBAR --- */
+  .sidebar {
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    padding: 2rem 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+  }
+
+  .logo {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .logo-eyebrow {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .logo-title {
+    font-family: var(--mono);
+    font-size: 16px;
+    font-weight: 500;
+    color: var(--text);
+    line-height: 1.3;
+  }
+  .logo-sub {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  .sidebar-section { display: flex; flex-direction: column; gap: 10px; }
+  .sidebar-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--hint);
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  .field input, .field select {
+    background: var(--bg3);
+    border: 1px solid var(--border2);
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.15s;
+    width: 100%;
+  }
+  .field input:focus, .field select:focus { border-color: var(--accent); }
+  .field input::placeholder { color: var(--hint); }
+  select option { background: #1a1e1e; }
+
+  .run-btn {
+    background: var(--accent);
+    color: #041a14;
+    border: none;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+    width: 100%;
+    transition: background 0.15s, opacity 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .run-btn:hover { background: #00ebbf; }
+  .run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .api-note {
+    font-size: 11px;
+    color: var(--hint);
+    line-height: 1.5;
+    font-family: var(--mono);
+  }
+  .api-note a { color: var(--accent2); text-decoration: none; }
+  .api-note a:hover { text-decoration: underline; }
+
+  /* --- MAIN --- */
+  .main { padding: 2rem 2.5rem; overflow-y: auto; }
+
+  /* STATE: empty */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 70vh;
+    gap: 1rem;
+    text-align: center;
+  }
+  .empty-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-top: 1.5rem;
+    max-width: 560px;
+  }
+  .empty-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    text-align: left;
+  }
+  .empty-card-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--accent);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 5px;
+  }
+  .empty-card p { font-size: 12px; color: var(--muted); line-height: 1.5; }
+  .empty-icon { font-size: 40px; opacity: 0.3; }
+  .empty-title { font-size: 20px; font-weight: 300; color: var(--muted); }
+  .empty-hint { font-size: 13px; color: var(--hint); }
+
+  /* STATE: loading */
+  .loading-state { padding: 4rem 0; display: flex; flex-direction: column; gap: 2rem; }
+  .loading-step {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--hint);
+    transition: color 0.3s;
+  }
+  .loading-step.active { color: var(--accent); }
+  .loading-step.done { color: var(--muted); }
+  .step-icon {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 1px solid var(--border2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    flex-shrink: 0;
+  }
+  .loading-step.active .step-icon { border-color: var(--accent); color: var(--accent); }
+  .loading-step.done .step-icon { border-color: var(--muted); color: var(--muted); background: var(--bg3); }
+  .spinner { animation: spin 1s linear infinite; display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* RESULTS */
+  .results { animation: fadeUp 0.4s ease; }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* Results header */
+  .results-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .results-title { font-size: 11px; color: var(--hint); font-family: var(--mono); letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 6px; }
+  .results-version { font-size: 26px; font-weight: 300; color: var(--text); font-family: var(--mono); }
+  .results-meta { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  .risk-badge {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .risk-badge-label { font-size: 10px; font-family: var(--mono); letter-spacing: 0.1em; text-transform: uppercase; }
+  .risk-badge-score { font-size: 36px; font-weight: 600; font-family: var(--mono); line-height: 1; }
+  .risk-badge-level { font-size: 11px; font-family: var(--mono); letter-spacing: 0.08em; text-transform: uppercase; }
+  .badge-high .risk-badge-label, .badge-high .risk-badge-score, .badge-high .risk-badge-level { color: var(--r-high); }
+  .badge-medium .risk-badge-label, .badge-medium .risk-badge-score, .badge-medium .risk-badge-level { color: var(--r-med); }
+  .badge-low .risk-badge-label, .badge-low .risk-badge-score, .badge-low .risk-badge-level { color: var(--r-low); }
+
+  /* Summary banner */
+  .summary-banner {
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    font-size: 13px;
+    line-height: 1.7;
+    border: 1px solid;
+  }
+  .summary-banner.high { background: var(--r-high-bg); border-color: var(--r-high-border); color: #ffaaaa; }
+  .summary-banner.medium { background: var(--r-med-bg); border-color: var(--r-med-border); color: #f0c080; }
+  .summary-banner.low { background: var(--r-low-bg); border-color: var(--r-low-border); color: #80e8d4; }
+
+  /* Two-col layout */
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2rem; }
+
+  /* Section */
+  .section { margin-bottom: 2rem; }
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 1rem;
+  }
+  .section-title {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--hint);
+  }
+  .section-count {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 1px 7px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--muted);
+  }
+
+  /* Tickets table */
+  .ticket-list { display: flex; flex-direction: column; gap: 6px; }
+  .ticket-row {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 12px;
+    align-items: center;
+    font-size: 13px;
+    transition: border-color 0.12s;
+  }
+  .ticket-row:hover { border-color: var(--border2); }
+  .ticket-key {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  .ticket-summary { color: var(--text); }
+  .ticket-pri {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 10px;
+    white-space: nowrap;
+  }
+  .pri-p0 { background: rgba(255,95,95,0.15); color: var(--r-high); border: 1px solid rgba(255,95,95,0.25); }
+  .pri-p1 { background: rgba(240,160,64,0.12); color: var(--r-med); border: 1px solid rgba(240,160,64,0.2); }
+  .pri-p2 { background: rgba(100,120,120,0.15); color: var(--muted); border: 1px solid var(--border); }
+  .pri-p3 { background: transparent; color: var(--hint); border: 1px solid var(--border); }
+
+  /* Subsystem cards */
+  .sub-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+  .sub-card {
+    border-radius: 8px;
+    padding: 12px 14px;
+    border: 1px solid;
+  }
+  .sub-card.high { background: var(--r-high-bg); border-color: var(--r-high-border); }
+  .sub-card.medium { background: var(--r-med-bg); border-color: var(--r-med-border); }
+  .sub-card.low { background: var(--r-low-bg); border-color: var(--r-low-border); }
+  .sub-name { font-family: var(--mono); font-size: 12px; font-weight: 500; margin-bottom: 4px; }
+  .sub-card.high .sub-name { color: var(--r-high); }
+  .sub-card.medium .sub-name { color: var(--r-med); }
+  .sub-card.low .sub-name { color: var(--r-low); }
+  .sub-reason { font-size: 11px; line-height: 1.5; }
+  .sub-card.high .sub-reason { color: #cc9090; }
+  .sub-card.medium .sub-reason { color: #c09060; }
+  .sub-card.low .sub-reason { color: #60a898; }
+  .sub-tickets { font-family: var(--mono); font-size: 10px; margin-top: 6px; }
+  .sub-card.high .sub-tickets { color: rgba(255,95,95,0.6); }
+  .sub-card.medium .sub-tickets { color: rgba(240,160,64,0.6); }
+  .sub-card.low .sub-tickets { color: rgba(0,212,170,0.5); }
+
+  /* Test cases */
+  .tc-list { display: flex; flex-direction: column; gap: 8px; }
+  .tc-item {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    transition: border-color 0.12s;
+  }
+  .tc-item:hover { border-color: var(--border2); }
+  .tc-pri-badge {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    padding: 3px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+    margin-top: 1px;
+  }
+  .tc-p1 { background: rgba(255,95,95,0.12); color: var(--r-high); border: 1px solid rgba(255,95,95,0.25); }
+  .tc-p2 { background: rgba(240,160,64,0.1); color: var(--r-med); border: 1px solid rgba(240,160,64,0.2); }
+  .tc-p3 { background: rgba(0,212,170,0.07); color: var(--r-low); border: 1px solid rgba(0,212,170,0.2); }
+  .tc-body { flex: 1; }
+  .tc-name { font-size: 13px; font-weight: 500; color: var(--text); margin-bottom: 3px; }
+  .tc-why { font-size: 12px; color: var(--muted); line-height: 1.5; margin-bottom: 5px; }
+  .tc-meta { display: flex; gap: 10px; }
+  .tc-sub { font-family: var(--mono); font-size: 10px; color: var(--hint); }
+  .tc-ticket { font-family: var(--mono); font-size: 10px; color: var(--accent2); }
+
+  /* Advice */
+  .advice-box {
+    background: var(--bg2);
+    border: 1px solid var(--border2);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 8px 8px 0;
+    padding: 1rem 1.25rem;
+  }
+  .advice-box p { font-size: 13px; color: var(--text); line-height: 1.7; }
+
+  /* Error */
+  .error-box {
+    background: var(--r-high-bg);
+    border: 1px solid var(--r-high-border);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: #ff9090;
+    margin-bottom: 1rem;
+  }
+
+  /* Test cycle table */
+  .cycle-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .cycle-table th { text-align: left; padding: 7px 12px; background: var(--bg3); border-bottom: 1px solid var(--border2); font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--hint); }
+  .cycle-table td { padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .cycle-table tr:last-child td { border-bottom: none; }
+  .cycle-table tr:hover td { background: var(--bg2); }
+  .cycle-name { font-family: var(--mono); font-size: 11px; color: var(--text); }
+  .cycle-reason { font-size: 12px; color: var(--muted); }
+  .run-type { font-family: var(--mono); font-size: 10px; padding: 2px 7px; border-radius: 4px; border: 1px solid; white-space: nowrap; }
+  .run-full { color: var(--r-high); border-color: var(--r-high-border); background: var(--r-high-bg); }
+  .run-regression { color: var(--r-med); border-color: var(--r-med-border); background: var(--r-med-bg); }
+  .run-smoke { color: var(--r-low); border-color: var(--r-low-border); background: var(--r-low-bg); }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--bg4); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="logo">
+      <span class="logo-eyebrow">// arlo · pega</span>
+      <span class="logo-title">Regression<br>Risk Assessor</span>
+      <span class="logo-sub">Jira-powered · Claude AI</span>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Release</div>
+      <div class="field">
+        <label>Model ID</label>
+        <input type="text" id="model-id" placeholder="e.g. VMC4040P, Lory, Harpy" value="AVD6001" />
+      </div>
+      <div class="field">
+        <label>FW Version</label>
+        <input type="text" id="fw-version" placeholder="e.g. 1.130.18.0" value="0.100.159_b075390" />
+      </div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Data source</div>
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:10px;background:var(--bg3);border:1px solid var(--border2);border-radius:6px">
+        <input type="checkbox" id="use-mcp" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer" />
+        <span style="font-family:var(--mono);font-size:12px;color:var(--text)">Direct Arlochat MCP<br><span style="color:var(--hint);font-size:10px">Requires VPN · no token needed</span></span>
+      </label>
+      <div class="field" style="margin-top:8px">
+        <label>Anthropic key <span style="font-size:10px;color:var(--hint)">(optional — for AI analysis)</span></label>
+        <input type="password" id="anthropic-key" placeholder="sk-ant-…" />
+      </div>
+      <div class="api-note">
+        <b style="color:var(--accent)">MCP on</b> → requires <code style="font-size:10px;color:var(--muted)">python proxy.py</code> + VPN. Fetches GitHub, Jira, Confluence + Zephyr via local proxy. Add Anthropic key for AI analysis, or leave blank for rule-based scoring.<br><br>
+        <b style="color:var(--hint)">MCP off</b> → demo mode (no data fetching).<br><br>
+        <a href="https://console.anthropic.com/settings/keys" target="_blank">Get Anthropic key ↗</a>
+      </div>
+    </div>
+
+    <button class="run-btn" id="run-btn" onclick="runAssessment()">
+      <span id="btn-text">RUN ASSESSMENT</span>
+      <span>↗</span>
+    </button>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main" id="main">
+    <div class="empty-state" id="empty-state">
+      <div class="empty-icon">⬡</div>
+      <div class="empty-title">No assessment loaded</div>
+      <div class="empty-hint">Enter a model ID and FW version to begin</div>
+      <div class="empty-grid">
+        <div class="empty-card">
+          <div class="empty-card-label">Step 1</div>
+          <p>Claude finds the relevant GitHub repos and release ref for your model + version</p>
+        </div>
+        <div class="empty-card">
+          <div class="empty-card-label">Step 2</div>
+          <p>Commits are scanned for ticket keys like PEGA-123, CMFW-456, SV-78</p>
+        </div>
+        <div class="empty-card">
+          <div class="empty-card-label">Step 3</div>
+          <p>Jira tickets are fetched, then Claude maps subsystem risk and test priorities</p>
+        </div>
+      </div>
+    </div>
+    <div id="output"></div>
+  </main>
+
+</div>
+
+<script>
+// ── MCP CLIENT ───────────────────────────────────────────
+class McpClient {
+  constructor(serverUrl, authToken, onLog) {
+    this.serverUrl = serverUrl;
+    this.authToken = (authToken || '').replace(/^Bearer\s+/i, '');
+    this.onLog = onLog || (() => {});
+    this.sessionUrl = null;
+    this.pending = new Map();
+    this._id = 0;
+    this._onEndpoint = null;
+    this._toolsCache = null;
+  }
+
+  async connect() {
+    const headers = { 'Accept': 'text/event-stream' };
+    if (this.authToken) headers['Authorization'] = `Bearer ${this.authToken}`;
+    const resp = await fetch(this.serverUrl, { headers });
+    if (!resp.ok) throw new Error(`MCP SSE ${resp.status} — check VPN and token`);
+    this.onLog('SSE stream open', 'tool');
+    this._readStream(resp.body);
+    await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error('MCP endpoint timeout (10s) — is VPN on?')), 10000);
+      this._onEndpoint = url => { clearTimeout(t); this.sessionUrl = url; res(); };
+    });
+    await this._rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'fw-regression-assessor', version: '1.0' } });
+    await this._notify('notifications/initialized');
+    this.onLog('MCP handshake complete', 'success');
+  }
+
+  _readStream(body) {
+    const reader = body.getReader(), dec = new TextDecoder();
+    let buf = '', evt = '';
+    const loop = async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n'); buf = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line.startsWith('event:')) evt = line.slice(6).trim();
+          else if (line.startsWith('data:')) { this._onData(evt, line.slice(5).trim()); evt = ''; }
+        }
+      }
+    };
+    loop().catch(() => {});
+  }
+
+  _onData(evType, data) {
+    if (evType === 'endpoint') {
+      const url = data.startsWith('http') ? data : new URL(data, this.serverUrl).href;
+      this._onEndpoint?.(url); return;
+    }
+    try {
+      const msg = JSON.parse(data);
+      if (msg.id != null) {
+        const p = this.pending.get(msg.id);
+        if (p) { this.pending.delete(msg.id); msg.error ? p.reject(new Error(msg.error.message ?? JSON.stringify(msg.error))) : p.resolve(msg.result); }
+      }
+    } catch {}
+  }
+
+  async _post(body) {
+    const h = { 'Content-Type': 'application/json' };
+    if (this.authToken) h['Authorization'] = `Bearer ${this.authToken}`;
+    const r = await fetch(this.sessionUrl, { method: 'POST', headers: h, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error(`MCP POST ${r.status}`);
+  }
+
+  _rpc(method, params) {
+    const id = ++this._id;
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => { this.pending.delete(id); reject(new Error(`RPC timeout: ${method}`)); }, 60000);
+      this.pending.set(id, { resolve: r => { clearTimeout(t); resolve(r); }, reject: e => { clearTimeout(t); reject(e); } });
+      this._post({ jsonrpc: '2.0', id, method, params }).catch(e => { this.pending.delete(id); clearTimeout(t); reject(e); });
+    });
+  }
+
+  _notify(method, params = {}) { return this._post({ jsonrpc: '2.0', method, params }); }
+
+  async listTools() {
+    if (this._toolsCache) return this._toolsCache;
+    const res = await this._rpc('tools/list', {});
+    this._toolsCache = res?.tools ?? [];
+    return this._toolsCache;
+  }
+
+  async callTool(name, args) {
+    this.onLog(`→ ${name}`, 'tool');
+    const result = await this._rpc('tools/call', { name, arguments: args });
+    const text = (result?.content ?? []).filter(c => c.type === 'text').map(c => c.text).join('\n');
+    this.onLog(`  ← ${text.length} chars`, 'tool');
+    return text;
+  }
+
+  close() { /* SSE fetch streams auto-close; nothing to do */ }
+}
+
+// ── HELPERS ─────────────────────────────────────────────
+function setLoading(steps) {
+  document.getElementById('empty-state').style.display = 'none';
+  const html = steps.map((s, i) => `
+    <div class="loading-step" id="step-${i}">
+      <div class="step-icon" id="step-icon-${i}">${i + 1}</div>
+      <span>${s}</span>
+    </div>`).join('');
+  document.getElementById('output').innerHTML = `<div class="loading-state">${html}</div>`;
+}
+
+function activateStep(i) {
+  document.querySelectorAll('.loading-step').forEach((el, idx) => {
+    if (idx < i) { el.classList.remove('active'); el.classList.add('done'); document.getElementById(`step-icon-${idx}`).textContent = '✓'; }
+    else if (idx === i) { el.classList.add('active'); document.getElementById(`step-icon-${idx}`).innerHTML = '<span class="spinner">◌</span>'; }
+  });
+}
+
+function showError(msg) {
+  document.getElementById('output').innerHTML = `<div class="error-box">// error: ${msg}</div>`;
+  document.getElementById('run-btn').disabled = false;
+  document.getElementById('btn-text').textContent = 'RUN ASSESSMENT';
+}
+
+// ── MCP CALL HELPER ──────────────────────────────────────
+async function mcpCall(anthropicKey, userPrompt, maxTokens = 8000) {
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': anthropicKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'mcp-client-2025-04-04',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: maxTokens,
+      tools: [{
+        type: 'mcp',
+        name: 'arlochat',
+        url: 'https://internal-arlochat-mcp-alb-880426873.us-east-1.elb.amazonaws.com:8080/sse'
+      }],
+      messages: [{ role: 'user', content: userPrompt }]
+    })
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.error?.message || `API error ${resp.status}`);
+  }
+  const data = await resp.json();
+  return data.content || [];
+}
+
+function extractText(blocks) {
+  return blocks.filter(b => b.type === 'text').map(b => b.text).join('\n');
+}
+
+function parseJsonFromText(text) {
+  const clean = text.replace(/```json|```/g, '').trim();
+  // Try full parse first
+  try { return JSON.parse(clean); } catch(e) {}
+  // Try extracting first JSON object or array
+  const objMatch = clean.match(/\{[\s\S]*\}/);
+  if (objMatch) try { return JSON.parse(objMatch[0]); } catch(e) {}
+  const arrMatch = clean.match(/\[[\s\S]*\]/);
+  if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch(e) {}
+  return null;
+}
+
+// ── STEP 1: AGENTIC REPO + COMMIT DISCOVERY ─────────────
+// Single agentic MCP call. Claude figures out:
+//   - which repos in arlo-engineering are relevant for this model
+//   - which branch/tag corresponds to this FW version
+//   - fetches the commits for that range
+// Returns parsed commit data with ticket keys extracted.
+async function discoverCommits(modelId, fwVersion, anthropicKey) {
+  const prompt = `You are a firmware release engineer at Arlo. Use the github_cli tool to find all commits related to a firmware release for model "${modelId}", version "${fwVersion}" in the arlo-engineering GitHub org.
+
+Follow these steps using the github_cli tool:
+
+1. First, identify the relevant firmware repositories for "${modelId}". Known repos include: camif-mcu-harpy, camif-isp2mcu, nim, sv_rk1103b, fwbabycam, camif-isp-harpy. Use your knowledge of which repos are relevant for this model name (e.g. "Harpy" → camif-mcu-harpy + camif-isp2mcu, "Lory"/"PEGA" → camif-mcu-harpy + camif-isp2mcu + nim, generic model IDs → search all likely candidates).
+
+2. For each relevant repo, find the branch or tag that corresponds to version "${fwVersion}". Try:
+   - gh api repos/arlo-engineering/{repo}/branches --jq '[.[].name]' to list branches
+   - Look for branches matching the version string, release branches like "release/...", or master/main if nothing version-specific exists
+   - gh api repos/arlo-engineering/{repo}/tags --jq '[.[].name]' to check for version tags
+
+3. For each identified repo+ref, fetch recent commits:
+   - If you found a version-specific branch or tag, compare it against the previous release branch/tag:
+     gh api repos/arlo-engineering/{repo}/compare/{prev}...{current} --jq '[.commits[] | {sha: .sha[0:8], msg: .commit.message, repo: "{repo}"}]'
+   - If only master/main exists, fetch the last 60 commits:
+     gh api "repos/arlo-engineering/{repo}/commits?sha=master&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "{repo}"}]'
+
+4. Collect ALL commits from ALL relevant repos into one list.
+
+Return ONLY a JSON object in this exact format, no explanation:
+{
+  "repos_searched": ["repo1", "repo2"],
+  "refs_used": {"repo1": "branch-or-tag", "repo2": "branch-or-tag"},
+  "commits": [
+    {"sha": "abcd1234", "msg": "PEGA-123: fix something", "repo": "camif-mcu-harpy"},
+    ...
+  ]
+}`;
+
+  const blocks = await mcpCall(anthropicKey, prompt, 12000);
+  const text = extractText(blocks);
+  const parsed = parseJsonFromText(text);
+
+  if (!parsed || !Array.isArray(parsed.commits)) {
+    // Try pulling from mcp_tool_result blocks directly as fallback
+    let allCommits = [];
+    for (const b of blocks) {
+      if (b.type === 'mcp_tool_result') {
+        const t = b.content?.[0]?.text || '';
+        const arr = parseJsonFromText(t);
+        if (Array.isArray(arr)) allCommits = allCommits.concat(arr);
+      }
+    }
+    if (!allCommits.length) throw new Error(`Could not find commits for ${modelId} ${fwVersion}. Try the demo mode (leave key blank) to see expected output.`);
+    return { repos_searched: [], refs_used: {}, commits: allCommits };
+  }
+
+  return parsed;
+}
+
+// ── EXTRACT TICKET KEYS FROM COMMITS ────────────────────
+function extractTicketKeys(commits) {
+  const keyPattern = /\b([A-Z][A-Z0-9]+-\d+)\b/g;
+  const seen = new Set();
+  const commitData = [];
+
+  for (const c of commits) {
+    const msg = (c.msg || c.message || '').split('\n')[0];
+    const keys = [];
+    let m;
+    keyPattern.lastIndex = 0;
+    while ((m = keyPattern.exec(msg)) !== null) {
+      if (!seen.has(m[1])) { seen.add(m[1]); }
+      if (!keys.includes(m[1])) keys.push(m[1]);
+    }
+    if (keys.length) commitData.push({ sha: c.sha || '?', msg, repo: c.repo || '', keys });
+  }
+
+  return { commitData, ticketKeys: [...seen] };
+}
+
+// ── STEP 2: FETCH JIRA DETAILS ───────────────────────────
+async function fetchJiraDetails(ticketKeys, anthropicKey) {
+  if (!ticketKeys.length) return [];
+  const keyList = ticketKeys.map(k => `"${k}"`).join(', ');
+  const jql = `issueKey in (${keyList}) ORDER BY priority ASC`;
+
+  const prompt = `Use the jira_search tool with this JQL: ${jql}
+Use fields: summary,priority,status,assignee. Set limit to ${ticketKeys.length + 5}.
+Return ONLY a JSON array. Each item: {"key":"...","summary":"...","priority":"...","status":"...","assignee":"..."}
+No explanation, no markdown fences.`;
+
+  const blocks = await mcpCall(anthropicKey, prompt, 6000);
+  const raw = extractText(blocks);
+  const extractProject = k => k ? k.replace(/-\d+$/, '') : '?';
+  const normPri = raw => {
+    const s = (raw || '').toString().toUpperCase();
+    if (s === 'P0' || s.includes('BLOCKER')) return 'P0';
+    if (s === 'P1' || s.includes('CRITICAL')) return 'P1';
+    if (s === 'P3' || s.includes('MINOR')) return 'P3';
+    return 'P2';
+  };
+
+  const arr = parseJsonFromText(raw);
+  if (Array.isArray(arr) && arr.length) {
+    return arr.map(t => ({
+      key: t.key || '', project: extractProject(t.key),
+      summary: t.summary || '(no summary)',
+      priority: normPri(t.priority), status: t.status || '', assignee: t.assignee || ''
+    })).filter(t => t.key);
+  }
+
+  // Fallback: markdown table
+  const lines = raw.split('\n').filter(l => l.startsWith('|') && !l.includes('---'));
+  if (lines.length > 1) {
+    const headers = lines[0].split('|').map(h => h.trim().toLowerCase()).filter(Boolean);
+    return lines.slice(1).map(row => {
+      const cells = row.split('|').map(c => c.trim()).filter(Boolean);
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = cells[i] || ''; });
+      const key = obj['key'] || '';
+      return { key, project: extractProject(key), summary: obj['summary'] || '', priority: normPri(obj['priority']), status: obj['status'] || '', assignee: obj['assignee'] || '' };
+    }).filter(t => t.key);
+  }
+
+  // Last resort: stubs so the assessment can still run
+  return ticketKeys.map(k => ({ key: k, project: extractProject(k), summary: '(Jira fetch failed)', priority: 'P2', status: '', assignee: '' }));
+}
+
+// ── JIRA NORMALIZER (shared) ─────────────────────────────
+function normalizeJiraResults(raw, fallbackKeys = []) {
+  const extractProject = k => k ? k.replace(/-\d+$/, '') : '?';
+  const normPri = v => {
+    const s = (v || '').toString().toUpperCase();
+    if (s === 'P0' || s.includes('BLOCKER')) return 'P0';
+    if (s === 'P1' || s.includes('CRITICAL')) return 'P1';
+    if (s === 'P3' || s.includes('MINOR')) return 'P3';
+    return 'P2';
+  };
+  const arr = parseJsonFromText(raw);
+  if (Array.isArray(arr) && arr.length) {
+    return arr.map(t => ({ key: t.key || '', project: extractProject(t.key), summary: t.summary || '(no summary)', priority: normPri(t.priority), status: t.status || '', assignee: t.assignee || '' })).filter(t => t.key);
+  }
+  const lines = raw.split('\n').filter(l => l.startsWith('|') && !l.includes('---'));
+  if (lines.length > 1) {
+    const headers = lines[0].split('|').map(h => h.trim().toLowerCase()).filter(Boolean);
+    return lines.slice(1).map(row => {
+      const cells = row.split('|').map(c => c.trim()).filter(Boolean);
+      const obj = {}; headers.forEach((h, i) => { obj[h] = cells[i] || ''; });
+      const key = obj['key'] || '';
+      return { key, project: extractProject(key), summary: obj['summary'] || '', priority: normPri(obj['priority']), status: obj['status'] || '', assignee: obj['assignee'] || '' };
+    }).filter(t => t.key);
+  }
+  return fallbackKeys.map(k => ({ key: k, project: extractProject(k), summary: '(fetch failed)', priority: 'P2', status: '', assignee: '' }));
+}
+
+// ── DIRECT MCP: COMMIT DISCOVERY ─────────────────────────
+async function discoverCommitsViaMcp(modelId, fwVersion, client) {
+  const tools = await client.listTools();
+  const toolNames = tools.map(t => t.name);
+  log(`Tools available: ${toolNames.join(', ')}`, 'info');
+
+  const ghTool = toolNames.find(t => t === 'github_cli') || toolNames.find(t => t.includes('github')) || 'github_cli';
+  log(`Using GitHub tool: ${ghTool}`, 'info');
+
+  // Find all repos in org
+  const repoRaw = await client.callTool(ghTool, {
+    command: `gh repo list arlo-engineering --limit 200 --json name --jq '[.[].name]'`
+  });
+  let allRepoNames = [];
+  try { allRepoNames = JSON.parse(repoRaw); } catch {}
+
+  // Filter candidates
+  const modelLower = modelId.toLowerCase();
+  const fallback = ['camif-mcu-harpy', 'camif-isp2mcu', 'nim', 'sv_rk1103b', 'fwbabycam'];
+  let candidates = allRepoNames.filter(r =>
+    r.toLowerCase().includes(modelLower) || r.toLowerCase().startsWith('camif') ||
+    r.toLowerCase().startsWith('fw') || r === 'nim' || r === 'sv_rk1103b'
+  );
+  if (!candidates.length) candidates = fallback;
+  candidates = candidates.slice(0, 6);
+  log(`Repos to search: ${candidates.join(', ')}`, 'info');
+
+  const refsUsed = {}, allCommits = [];
+
+  for (const repo of candidates) {
+    // Find ref matching fwVersion
+    const tagsRaw = await client.callTool(ghTool, { command: `gh api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
+    let ref = 'master';
+    try {
+      const tags = JSON.parse(tagsRaw);
+      const match = tags.find(t => t.includes(fwVersion) || fwVersion.includes(t.replace(/^v/, '')));
+      if (match) { ref = match; }
+      else {
+        const brRaw = await client.callTool(ghTool, { command: `gh api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
+        const branches = JSON.parse(brRaw || '[]');
+        const bMatch = branches.find(b => b.includes(fwVersion)) || branches.find(b => b.includes('release'));
+        if (bMatch) ref = bMatch;
+      }
+    } catch {}
+
+    const commitsRaw = await client.callTool(ghTool, {
+      command: `gh api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
+    });
+    try {
+      const parsed = JSON.parse(commitsRaw);
+      if (Array.isArray(parsed) && parsed.length) {
+        allCommits.push(...parsed);
+        refsUsed[repo] = ref;
+        log(`${repo}@${ref}: ${parsed.length} commits`, 'success');
+      }
+    } catch {}
+  }
+
+  return { repos_searched: candidates, refs_used: refsUsed, commits: allCommits };
+}
+
+// ── DIRECT MCP: JIRA FULL READ ───────────────────────────
+async function fetchJiraDetailsViaMcp(ticketKeys, client) {
+  if (!ticketKeys.length) return { tickets: [], fullDetails: '' };
+  const tools = await client.listTools();
+  const readTool  = tools.find(t => t.name === 'jira_read_issue')?.name;
+  const searchTool = tools.find(t => t.name === 'jira_search')?.name || 'jira_search';
+
+  if (!readTool) {
+    log('jira_read_issue not found — falling back to jira_search', 'info');
+    const raw = await client.callTool(searchTool, { jql: `issueKey in (${ticketKeys.map(k=>`"${k}"`).join(',')}) ORDER BY priority ASC`, fields: 'summary,priority,status,assignee', limit: ticketKeys.length + 5 });
+    return { tickets: normalizeJiraResults(raw, ticketKeys), fullDetails: raw };
+  }
+
+  const tickets = [], detailParts = [];
+  const extractProject = k => k.replace(/-\d+$/, '');
+  const normPri = v => { const s = (v||'').toUpperCase(); return s.includes('BLOCKER')||s==='P0'?'P0':s.includes('CRITICAL')||s==='P1'?'P1':s.includes('MINOR')||s==='P3'?'P3':'P2'; };
+
+  for (const key of ticketKeys.slice(0, 20)) {
+    log(`Reading ${key}`, 'tool');
+    const raw = await client.callTool(readTool, { issue_key: key, include_comments: false });
+    detailParts.push(`=== ${key} ===\n${raw.slice(0, 3000)}`);
+
+    let summary = key, priority = 'P2', status = '', assignee = '';
+    try {
+      const j = JSON.parse(raw);
+      summary  = j.fields?.summary || j.summary || key;
+      priority = normPri(j.fields?.priority?.name || j.priority || '');
+      status   = j.fields?.status?.name || j.status || '';
+      assignee = j.fields?.assignee?.displayName || j.assignee || '';
+    } catch {
+      summary  = raw.match(/(?:summary|title)[:\s]+([^\n]+)/i)?.[1]?.trim() || key;
+      priority = normPri(raw.match(/priority[:\s]+([^\n]+)/i)?.[1] || '');
+      status   = raw.match(/status[:\s]+([^\n]+)/i)?.[1]?.trim() || '';
+    }
+    tickets.push({ key, project: extractProject(key), summary, priority, status, assignee });
+  }
+  return { tickets, fullDetails: detailParts.join('\n\n') };
+}
+
+// ── DIRECT MCP: CONFLUENCE CONTEXT ───────────────────────
+async function fetchConfluenceContextViaMcp(modelId, client) {
+  const tools = await client.listTools();
+  const searchTool = tools.find(t => t.name === 'confluence_search')?.name;
+  const readTool   = tools.find(t => t.name === 'confluence_read_page')?.name;
+  if (!searchTool) { log('confluence_search not available', 'info'); return ''; }
+
+  log(`Searching Confluence for "${modelId}"...`, 'tool');
+  const searchRaw = await client.callTool(searchTool, { cql: `text ~ "${modelId}" AND type = page ORDER BY lastModified DESC` });
+
+  let context = searchRaw.slice(0, 1500);
+  if (readTool) {
+    const pageIds = [...searchRaw.matchAll(/(\d{7,})/g)].map(m => m[1]).slice(0, 2);
+    for (const pid of pageIds) {
+      log(`Reading Confluence page ${pid}`, 'tool');
+      const page = await client.callTool(readTool, { page_id: pid, max_chars: 3000 });
+      context += `\n=== Confluence ${pid} ===\n${page}\n`;
+    }
+  }
+  return context;
+}
+
+// ── DIRECT MCP: ZEPHYR TEST CYCLES ───────────────────────
+async function fetchZephyrTestCyclesViaMcp(projectKey, client) {
+  const tools = await client.listTools();
+  const listTool = tools.find(t => t.name === 'zephyr_list')?.name;
+  if (!listTool) { log('zephyr_list not available', 'info'); return ''; }
+
+  log(`Fetching Zephyr cycles for ${projectKey}...`, 'tool');
+  return client.callTool(listTool, { type: 'cycles', project_key: projectKey, max_results: 50 });
+}
+
+function primaryProject(ticketKeys) {
+  const counts = {};
+  ticketKeys.forEach(k => { const p = k.replace(/-\d+$/, ''); counts[p] = (counts[p]||0) + 1; });
+  return Object.entries(counts).sort((a,b) => b[1]-a[1])[0]?.[0] || 'PEGA';
+}
+
+// ── RULE-BASED RISK ASSESSMENT ───────────────────────────
+function ruleBasedAssess(tickets, commitData, modelId, fwVersion, reposSearched, refsUsed) {
+  const KW = {
+    'MCU / RTOS':         ['mcu', 'rtos', 'crash', 'boot', 'reboot', 'exception', 'b-train', 'watchdog'],
+    'Wi-Fi Stack':        ['wifi', 'wi-fi', 'wlan', 'scan', 'ssid', 'channel', 'roam'],
+    'NIM Layer':          ['nim', 'ioctl'],
+    'BLE Onboarding FSM': ['ble', 'bluetooth', 'onboard', 'pairing', 'credential', 'provision'],
+    'Storage / UBI':      ['ubi', 'flash', 'storage', 'partition', 'nvram', 'nand'],
+    'ERPC Layer':         ['erpc', 'rpc', 'ipc'],
+    'OTA Manager':        ['ota', 'delta update', 'firmware update'],
+    'Power Manager':      ['power', 'battery', 'sleep', 'wake', 'pmic'],
+    'LED Controller':     ['led', 'indicator'],
+    'Camera Pipeline':    ['camera', 'isp', 'video', 'stream', 'encode', 'h264', 'h265'],
+    'Audio Subsystem':    ['audio', 'mic', 'speaker', 'aec'],
+    'Motion Detection':   ['motion', 'pir', 'smart alert'],
+  };
+  const PRI = { P0: 30, P1: 15, P2: 5, P3: 2 };
+  const hits = {};
+  let score = 0;
+
+  for (const t of tickets) {
+    score += PRI[t.priority] ?? 5;
+    const text = `${t.summary} ${t.key}`.toLowerCase();
+    for (const [sub, kws] of Object.entries(KW)) {
+      if (kws.some(k => text.includes(k))) {
+        if (!hits[sub]) hits[sub] = { tickets: [], score: 0 };
+        hits[sub].tickets.push(t.key);
+        hits[sub].score += PRI[t.priority] ?? 5;
+      }
+    }
+  }
+  // Also scan commit messages for unmatched subsystems
+  for (const c of commitData) {
+    const text = c.msg.toLowerCase();
+    for (const [sub, kws] of Object.entries(KW)) {
+      if (!hits[sub] && kws.some(k => text.includes(k))) hits[sub] = { tickets: c.keys.slice(0,2), score: 3 };
+    }
+  }
+
+  const repoCount = Object.keys(refsUsed).length;
+  score = Math.min(100, score + (repoCount - 1) * 5);
+  const overall = score >= 50 ? 'HIGH' : score >= 20 ? 'MEDIUM' : 'LOW';
+  const O = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+
+  const subsystems = Object.entries(hits)
+    .map(([name, { tickets, score: s }]) => ({ name, risk: s >= 25 ? 'HIGH' : s >= 8 ? 'MEDIUM' : 'LOW', reason: `${tickets.length} ticket${tickets.length !== 1 ? 's' : ''} affect this subsystem`, tickets }))
+    .sort((a, b) => O[a.risk] - O[b.risk]);
+
+  const testCases = subsystems.slice(0, 10).map(s => ({
+    priority: s.risk === 'HIGH' ? 'P1' : s.risk === 'MEDIUM' ? 'P2' : 'P3',
+    name: `${s.name} regression`,
+    why: `${s.tickets.join(', ')} modified this subsystem`,
+    subsystem: s.name,
+    related_tickets: s.tickets.slice(0, 3)
+  }));
+
+  const highNames = subsystems.filter(s => s.risk === 'HIGH').map(s => s.name);
+  const p0s = tickets.filter(t => t.priority === 'P0');
+
+  return {
+    overall_risk: overall,
+    risk_score: score,
+    summary: `${modelId} ${fwVersion} — ${tickets.length} tickets across ${repoCount} repo${repoCount !== 1 ? 's' : ''}. Risk score ${score}/100 (${overall}).${highNames.length ? ` High-risk subsystems: ${highNames.join(', ')}.` : ''}`,
+    subsystems,
+    test_cases: testCases,
+    key_advice: `${p0s.length ? `${p0s.length} P0 ticket(s) (${p0s.map(t => t.key).join(', ')}) — hold release until verified. ` : ''}Focus testing on ${highNames.join(', ') || 'all modified subsystems'}.${repoCount > 1 ? ` Cross-repo blast radius across ${Object.keys(refsUsed).join(', ')} — run integration tests across module boundaries.` : ''}`
+  };
+}
+
+// ── LOG PANEL (direct MCP mode) ──────────────────────────
+let _logEl = null;
+function log(msg, type = '') {
+  if (!_logEl) {
+    _logEl = document.createElement('div');
+    _logEl.style.cssText = 'font-family:var(--mono);font-size:11px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;margin-bottom:1.5rem;max-height:160px;overflow-y:auto;color:var(--muted)';
+    const out = document.getElementById('output');
+    out.parentNode.insertBefore(_logEl, out);
+  }
+  const line = document.createElement('div');
+  const colors = { tool: '#7a8fff', success: '#00d4aa', error: '#ff5f5f', info: '#f0a040' };
+  line.style.color = colors[type] || 'var(--muted)';
+  line.textContent = `${new Date().toTimeString().slice(0, 8)} ${msg}`;
+  _logEl.appendChild(line);
+  _logEl.scrollTop = _logEl.scrollHeight;
+}
+
+// ── STEP 3: CLAUDE RISK ASSESSMENT ──────────────────────
+async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearched, refsUsed, anthropicKey, extras = {}) {
+  const { ticketFullDetails = '', confluenceContext = '', zephyrCycles = '' } = extras;
+  const repoSummary = Object.entries(refsUsed||{}).map(([r,ref]) => `${r}@${ref}`).join(', ') || reposSearched.join(', ');
+
+  const ticketList = tickets.map(t => {
+    const msgs = commitData.filter(c => c.keys.includes(t.key)).slice(0,2).map(c => c.msg.slice(0,120)).join(' | ');
+    return `- ${t.key} [${t.priority}]: ${t.summary}${msgs ? `\n  commits: ${msgs}` : ''}`;
+  }).join('\n');
+
+  const hasZephyr = zephyrCycles.trim().length > 0;
+
+  const prompt = `You are a senior firmware QA engineer at Arlo. Analyze the firmware release for model "${modelId}" version "${fwVersion}" (repos: ${repoSummary}).
+
+## TICKETS & CODE CHANGES
+${ticketFullDetails || ticketList}
+
+${confluenceContext ? `## CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 3000)}\n` : ''}
+${hasZephyr ? `## EXISTING ZEPHYR TEST CYCLES\n${zephyrCycles.slice(0, 3000)}\n` : ''}
+
+Your task:
+1. For each ticket, identify which functional area it affects based on the actual description and code changes.
+2. ${hasZephyr ? 'Cross-reference those functional areas against the Zephyr test cycles listed above. Recommend specific named cycles to re-run, with priority.' : 'Recommend test cases grounded in the actual changes.'}
+3. Assess subsystem risk based on what actually changed.
+
+Return ONLY valid JSON (no markdown fences):
+{
+  "overall_risk": "HIGH"|"MEDIUM"|"LOW",
+  "risk_score": <1-100>,
+  "summary": "<2-3 sentences: overall risk, blast radius, any cross-project concerns>",
+  "subsystems": [
+    {"name":"<subsystem>","risk":"HIGH"|"MEDIUM"|"LOW","reason":"<max 12 words>","tickets":["KEY-1"]}
+  ],
+  ${hasZephyr ? `"test_cycle_recommendations": [
+    {"priority":"P1"|"P2"|"P3","cycle":"<exact cycle name from Zephyr list>","reason":"<which ticket/change drives this>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
+  ],` : ''}
+  "test_cases": [
+    {"priority":"P1"|"P2"|"P3","name":"<specific test>","why":"<1 sentence tied to an actual change>","subsystem":"<name>","related_tickets":["KEY-1"]}
+  ],
+  "key_advice": "<3-4 sentences of specific QA guidance for this exact release>"
+}
+
+Rules:
+- subsystems: 4-8 items, risk DESC. Real names: Wi-Fi Stack, BLE Onboarding FSM, NIM Layer, OTA Manager, Power Manager, MCU/RTOS, LED Controller, Camera Pipeline, Audio Subsystem, Storage/UBI, Motion Detection, ERPC Layer.
+- ${hasZephyr ? 'test_cycle_recommendations: use EXACT cycle names from the Zephyr list. P1 first. Only include cycles genuinely relevant to the changes.' : 'test_cases: 8-14 items, P1 first, each grounded in a specific ticket or commit.'}
+- test_cases: 5-8 items covering gaps not addressed by named test cycles.
+- Cross-project shared-code changes push risk_score higher.`;
+
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages: [{ role: 'user', content: prompt }] })
+  });
+  if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.error?.message || `Claude error ${resp.status}`); }
+  const data = await resp.json();
+  const raw = data.content.filter(b=>b.type==='text').map(b=>b.text).join('');
+  const parsed = parseJsonFromText(raw);
+  if (!parsed) throw new Error('Could not parse risk assessment');
+  return parsed;
+}
+
+// ── RENDER ───────────────────────────────────────────────
+function renderResults(assessment, tickets, commitData, modelId, fwVersion, reposSearched, refsUsed) {
+  const rC = assessment.overall_risk === 'HIGH' ? 'high' : assessment.overall_risk === 'MEDIUM' ? 'medium' : 'low';
+  const projects = [...new Set(tickets.map(t => t.project))];
+  const projColors = ['#00d4aa','#7a8fff','#f0a040','#ff7eb6','#a78bfa','#34d399'];
+  const projColor = p => projColors[projects.indexOf(p) % projColors.length];
+
+  const priBadge = pri => {
+    const p = (pri||'P2').toString().toUpperCase();
+    if (p==='P0'||p.includes('BLOCKER')) return `<span class="ticket-pri pri-p0">P0</span>`;
+    if (p==='P1'||p.includes('CRITICAL')) return `<span class="ticket-pri pri-p1">P1</span>`;
+    if (p==='P3'||p.includes('MINOR')) return `<span class="ticket-pri pri-p3">P3</span>`;
+    return `<span class="ticket-pri pri-p2">P2</span>`;
+  };
+
+  const projPills = Object.entries(tickets.reduce((a,t)=>{a[t.project]=(a[t.project]||0)+1;return a;},{}))
+    .map(([p,n])=>`<span style="font-family:var(--mono);font-size:11px;padding:3px 10px;border-radius:10px;border:1px solid;color:${projColor(p)};border-color:${projColor(p)}33;background:${projColor(p)}11">${p} · ${n}</span>`).join('');
+
+  // Repos used strip
+  const repoStrip = Object.entries(refsUsed||{}).length
+    ? Object.entries(refsUsed).map(([r,ref])=>`<span style="font-family:var(--mono);font-size:10px;color:var(--hint);background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:2px 7px">${r}<span style="color:var(--accent);margin-left:4px">@${ref}</span></span>`).join('')
+    : reposSearched.map(r=>`<span style="font-family:var(--mono);font-size:10px;color:var(--hint);background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:2px 7px">${r}</span>`).join('');
+
+  const commitStrip = commitData.slice(0,10).map(c=>
+    `<div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--border)">
+      <span style="font-family:var(--mono);font-size:10px;color:var(--hint);flex-shrink:0">${c.sha}</span>
+      ${c.repo ? `<span style="font-family:var(--mono);font-size:10px;color:var(--accent2);flex-shrink:0">${c.repo}</span>` : ''}
+      <span style="font-size:12px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${c.msg.slice(0,85)}</span>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--accent);flex-shrink:0">${c.keys.join(' ')}</span>
+    </div>`).join('');
+
+  const ticketRows = tickets.map(t=>`
+    <div class="ticket-row">
+      <span class="ticket-key" style="color:${projColor(t.project)}">${t.key}</span>
+      <span class="ticket-summary">${t.summary}</span>
+      ${priBadge(t.priority)}
+    </div>`).join('');
+
+  const subCards = (assessment.subsystems||[]).map(s=>{
+    const c = s.risk==='HIGH'?'high':s.risk==='MEDIUM'?'medium':'low';
+    return `<div class="sub-card ${c}">
+      <div class="sub-name">${s.name}</div>
+      <div class="sub-reason">${s.reason}</div>
+      ${(s.tickets||[]).length?`<div class="sub-tickets">${s.tickets.join(', ')}</div>`:''}
+    </div>`;
+  }).join('');
+
+  const tcItems = (assessment.test_cases||[]).map(t=>{
+    const pc = t.priority==='P1'?'tc-p1':t.priority==='P2'?'tc-p2':'tc-p3';
+    return `<div class="tc-item">
+      <span class="tc-pri-badge ${pc}">${t.priority}</span>
+      <div class="tc-body">
+        <div class="tc-name">${t.name}</div>
+        <div class="tc-why">${t.why}</div>
+        <div class="tc-meta">
+          <span class="tc-sub">// ${t.subsystem}</span>
+          ${(t.related_tickets||[]).length?`<span class="tc-ticket">${t.related_tickets.join(', ')}</span>`:''}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('output').innerHTML = `
+    <div class="results">
+      <div class="results-header">
+        <div>
+          <div class="results-title">${modelId}</div>
+          <div class="results-version">${fwVersion}</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${repoStrip}</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${projPills}</div>
+          <div class="results-meta" style="margin-top:6px">${commitData.length} commits · ${tickets.length} tickets · ${projects.length} project${projects.length!==1?'s':''} · ${new Date().toLocaleString()}</div>
+        </div>
+        <div class="risk-badge badge-${rC}">
+          <span class="risk-badge-label">risk score</span>
+          <span class="risk-badge-score">${assessment.risk_score}</span>
+          <span class="risk-badge-level">${assessment.overall_risk} RISK</span>
+        </div>
+      </div>
+
+      <div class="summary-banner ${rC}">${assessment.summary}</div>
+
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">Commits scanned</span>
+          <span class="section-count">${commitData.length} with ticket refs</span>
+        </div>
+        <div style="font-family:var(--mono)">${commitStrip}</div>
+      </div>
+
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">Tickets in this release</span>
+          <span class="section-count">${tickets.length}</span>
+        </div>
+        <div class="ticket-list">${ticketRows}</div>
+      </div>
+
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">Subsystems at risk</span>
+          <span class="section-count">${(assessment.subsystems||[]).length}</span>
+        </div>
+        <div class="sub-grid">${subCards}</div>
+      </div>
+
+      ${(assessment.test_cycle_recommendations||[]).length ? `
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">Zephyr test cycles to re-run</span>
+          <span class="section-count">${assessment.test_cycle_recommendations.length}</span>
+        </div>
+        <table class="cycle-table">
+          <thead><tr><th>Pri</th><th>Cycle</th><th>Tickets</th><th>Reason</th><th>Run</th></tr></thead>
+          <tbody>
+            ${assessment.test_cycle_recommendations.map(r => {
+              const pc = r.priority==='P1'?'tc-p1':r.priority==='P2'?'tc-p2':'tc-p3';
+              const rc = (r.run_type||'').toLowerCase();
+              const runClass = rc==='full'?'run-full':rc==='smoke'?'run-smoke':'run-regression';
+              return `<tr>
+                <td><span class="tc-pri-badge ${pc}">${r.priority||'P2'}</span></td>
+                <td><span class="cycle-name">${r.cycle||''}</span></td>
+                <td><span style="font-family:var(--mono);font-size:10px;color:var(--accent2)">${(r.tickets||[]).join(', ')}</span></td>
+                <td><span class="cycle-reason">${r.reason||''}</span></td>
+                <td><span class="run-type ${runClass}">${r.run_type||'regression'}</span></td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>` : ''}
+
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">${(assessment.test_cycle_recommendations||[]).length ? 'Additional test cases' : 'Test cases to prioritize'}</span>
+          <span class="section-count">${(assessment.test_cases||[]).length}</span>
+        </div>
+        <div class="tc-list">${tcItems}</div>
+      </div>
+
+      <div class="section">
+        <div class="section-header"><span class="section-title">QA advice</span></div>
+        <div class="advice-box"><p>${assessment.key_advice}</p></div>
+      </div>
+    </div>`;
+}
+
+// ── DEMO MODE ────────────────────────────────────────────
+function runDemo() {
+  const demoCommitData = [
+    { sha: 'a1b2c3d4', repo: 'camif-mcu-harpy', msg: 'PEGA-1152: [Lory] Fix RTOS crash on booting time read', keys: ['PEGA-1152'] },
+    { sha: 'b2c3d4e5', repo: 'camif-mcu-harpy', msg: 'PEGA-1143: Fix ubi_ready job scheduled too frequently', keys: ['PEGA-1143'] },
+    { sha: 'c3d4e5f6', repo: 'camif-mcu-harpy', msg: 'PEGA-1142: MCU Crash fix for B-Train exception release', keys: ['PEGA-1142'] },
+    { sha: 'd4e5f6a7', repo: 'nim',              msg: 'SV-441: Wi-Fi scan manager returns zero APs on quick scan', keys: ['SV-441'] },
+    { sha: 'e5f6a7b8', repo: 'nim',              msg: 'SV-438: NIM ioctl retry logic fix under concurrent access', keys: ['SV-438'] },
+    { sha: 'f6a7b8c9', repo: 'camif-isp2mcu',   msg: 'PEGA-979: Fix NIM ioctl error during BLE onboarding (60s delay)', keys: ['PEGA-979'] },
+    { sha: 'a7b8c9d0', repo: 'camif-isp2mcu',   msg: 'ARLO-2891: Common BLE credential write handler race condition', keys: ['ARLO-2891'] },
+    { sha: 'b8c9d0e1', repo: 'camif-mcu-harpy', msg: 'PEGA-1127: Battery low LED display error fix', keys: ['PEGA-1127'] },
+  ];
+  const demoTickets = [
+    { key: 'PEGA-1152', project: 'PEGA', summary: 'RTOS crash due to reading booting time', priority: 'P1' },
+    { key: 'PEGA-1143', project: 'PEGA', summary: 'ubi_ready job scheduled too frequently', priority: 'P0' },
+    { key: 'PEGA-1142', project: 'PEGA', summary: 'MCU Crash seen with B-Train exception release', priority: 'P0' },
+    { key: 'PEGA-979',  project: 'PEGA', summary: 'NIM ioctl error during BLE onboarding — 60s delay', priority: 'P1' },
+    { key: 'PEGA-1127', project: 'PEGA', summary: 'Battery low LED display error', priority: 'P2' },
+    { key: 'SV-441',    project: 'SV',   summary: 'Wi-Fi scan manager returns zero APs on quick scan', priority: 'P1' },
+    { key: 'SV-438',    project: 'SV',   summary: 'Shared NIM ioctl retry logic fails under concurrent access', priority: 'P1' },
+    { key: 'ARLO-2891', project: 'ARLO', summary: 'Common BLE credential write handler race condition', priority: 'P2' },
+  ];
+  renderResults(
+    { overall_risk:'HIGH', risk_score:87,
+      summary:'This release carries high regression risk — two P0 MCU crashes in camif-mcu-harpy and shared NIM/Wi-Fi fixes in the nim library affect all Arlo product lines. Cross-repo blast radius is significant and warrants full cross-SKU regression before field deployment.',
+      subsystems:[
+        {name:'MCU / RTOS',risk:'HIGH',reason:'Two P0 crash fixes, boot-time read race',tickets:['PEGA-1152','PEGA-1142']},
+        {name:'Wi-Fi Stack',risk:'HIGH',reason:'Shared scan manager fix affects all products',tickets:['SV-441','SV-438']},
+        {name:'NIM Layer',risk:'HIGH',reason:'Shared ioctl retry logic changed in common code',tickets:['SV-438','PEGA-979']},
+        {name:'Storage / UBI',risk:'HIGH',reason:'Scheduler frequency change risks partition corruption',tickets:['PEGA-1143']},
+        {name:'BLE Onboarding FSM',risk:'MEDIUM',reason:'Credential race + NIM timing changes may interact',tickets:['ARLO-2891','PEGA-979']},
+        {name:'ERPC Layer',risk:'MEDIUM',reason:'NIM ioctl retry touches ERPC call paths',tickets:['SV-438']},
+        {name:'LED Controller',risk:'LOW',reason:'Isolated LED display fix',tickets:['PEGA-1127']},
+      ],
+      test_cases:[
+        {priority:'P1',name:'MCU stability soak test (24h)',why:'Two P0 crash fixes require extended uptime validation',subsystem:'MCU / RTOS',related_tickets:['PEGA-1152','PEGA-1142']},
+        {priority:'P1',name:'BLE onboarding end-to-end (50 runs)',why:'NIM ioctl fix + credential race fix both touch the onboarding hot path',subsystem:'BLE Onboarding FSM',related_tickets:['PEGA-979','ARLO-2891']},
+        {priority:'P1',name:'Wi-Fi scan — all band/channel combinations',why:'Shared scan manager change must not regress any product using nim common code',subsystem:'Wi-Fi Stack',related_tickets:['SV-441']},
+        {priority:'P1',name:'NIM ioctl concurrent access stress test',why:'Retry logic fix must hold under simultaneous callers across ERPC boundaries',subsystem:'NIM Layer',related_tickets:['SV-438']},
+        {priority:'P1',name:'Boot cycle stress test (100 cold boots)',why:'Boot-time RTOS crash fix requires boot loop validation',subsystem:'MCU / RTOS',related_tickets:['PEGA-1152']},
+        {priority:'P1',name:'UBI partition integrity after factory reset',why:'ubi_ready frequency change risks corruption after reset',subsystem:'Storage / UBI',related_tickets:['PEGA-1143']},
+        {priority:'P2',name:'Onboarding under RF interference (20 runs)',why:'Wi-Fi + NIM changes should be validated in noisy RF environments',subsystem:'Wi-Fi Stack',related_tickets:['SV-441','PEGA-979']},
+        {priority:'P2',name:'Cross-SKU regression on nim common library',why:'nim changes affect all products — run regression on all affected SKUs',subsystem:'NIM Layer',related_tickets:['SV-441','SV-438']},
+        {priority:'P2',name:'ERPC call timeout under load',why:'NIM retry changes could mask ERPC timeouts in high-traffic scenarios',subsystem:'ERPC Layer',related_tickets:['SV-438']},
+        {priority:'P3',name:'Battery LED across all charge level transitions',why:'Isolated fix but all threshold transitions should be confirmed',subsystem:'LED Controller',related_tickets:['PEGA-1127']},
+      ],
+      key_advice:'The nim shared library changes (SV-441, SV-438) are the highest cross-repo risk — validate against every SKU pulling from that codebase before release. For PEGA, the two P0 MCU crash fixes warrant a 48-hour soak minimum. Run the BLE onboarding suite under load and RF interference together since ARLO-2891 and PEGA-979 interact at the credential-write/NIM boundary. Hold field deployment until UBI and RTOS soak results are clean.'
+    },
+    demoTickets, demoCommitData, document.getElementById('model-id').value || 'VMC4040P (Lory)', document.getElementById('fw-version').value || '0.100.159_b075390 (demo)',
+    ['camif-mcu-harpy','camif-isp2mcu','nim'],
+    {'camif-mcu-harpy':'b075390','camif-isp2mcu':'b075390','nim':'master'}
+  );
+}
+
+// ── MAIN RUN ─────────────────────────────────────────────
+async function runAssessment() {
+  const modelId      = document.getElementById('model-id').value.trim();
+  const fwVersion    = document.getElementById('fw-version').value.trim();
+  const useMcp       = document.getElementById('use-mcp').checked;
+  const anthropicKey = document.getElementById('anthropic-key').value.trim();
+
+  if (!modelId)   { document.getElementById('model-id').focus(); return; }
+  if (!fwVersion) { document.getElementById('fw-version').focus(); return; }
+
+  // ── DEMO MODE ─────────────────────────────────────────
+  if (!useMcp && !anthropicKey) {
+    setLoading(['Locating repos for model', 'Scanning commits', 'Fetching Jira details', 'Running risk analysis']);
+    [0,1,2,3].forEach((i) => setTimeout(() => activateStep(i), i * 600));
+    setTimeout(runDemo, 2800);
+    return;
+  }
+
+  const btn = document.getElementById('run-btn');
+
+  // ── API KEY WITHOUT MCP ────────────────────────────────
+  if (!useMcp && anthropicKey) {
+    document.getElementById('empty-state').style.display = 'none';
+    document.getElementById('output').innerHTML = `<div class="error-box">// GitHub, Jira, Confluence and Zephyr data require VPN access via Arlochat MCP.<br><br>Enable the <b style="color:var(--accent)">Direct Arlochat MCP</b> checkbox (requires VPN), then run again.<br><br>To test the UI without VPN, clear the API key and click Run for demo mode.</div>`;
+    return;
+  }
+  btn.disabled = true;
+  document.getElementById('btn-text').textContent = 'RUNNING…';
+  _logEl = null;
+
+  // ── DIRECT MCP MODE ───────────────────────────────────
+  if (useMcp) {
+    setLoading([
+      'Connecting to Arlochat MCP',
+      `GitHub: repos + commits for ${modelId}`,
+      'Jira: full ticket details',
+      'Confluence + Zephyr: docs + test cycles',
+      anthropicKey ? 'Claude AI risk analysis' : 'Rule-based risk analysis'
+    ]);
+    const client = new McpClient(
+      `${window.location.origin}/mcp/sse`,
+      null,
+      (msg, type) => log(msg, type)
+    );
+    try {
+      activateStep(0);
+      await client.connect();
+
+      activateStep(1);
+      const discovered = await discoverCommitsViaMcp(modelId, fwVersion, client);
+      const { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
+      if (!ticketKeys.length) throw new Error(`No ticket keys found in commits for ${modelId} ${fwVersion}.`);
+
+      activateStep(2);
+      const { tickets, fullDetails } = await fetchJiraDetailsViaMcp(ticketKeys, client);
+
+      activateStep(3);
+      const projKey = primaryProject(ticketKeys);
+      const [confluenceContext, zephyrCycles] = await Promise.all([
+        fetchConfluenceContextViaMcp(modelId, client).catch(() => ''),
+        fetchZephyrTestCyclesViaMcp(projKey, client).catch(() => '')
+      ]);
+      log(`Confluence: ${confluenceContext.length} chars | Zephyr: ${zephyrCycles.length} chars`, 'info');
+
+      activateStep(4);
+      const assessment = anthropicKey
+        ? await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, anthropicKey, { ticketFullDetails: fullDetails, confluenceContext, zephyrCycles })
+        : ruleBasedAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used);
+
+      setTimeout(() => renderResults(assessment, tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used), 300);
+    } catch(e) {
+      client.close();
+      showError(e.message);
+    }
+    btn.disabled = false;
+    document.getElementById('btn-text').textContent = 'RUN ASSESSMENT';
+    return;
+  }
+
+}
+
+['model-id','fw-version'].forEach(id => {
+  document.getElementById(id).addEventListener('keydown', e => { if (e.key === 'Enter') runAssessment(); });
+});
+
+</script>
+</body>
+</html>

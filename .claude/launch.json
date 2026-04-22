@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "MCP proxy (use this for VPN/Arlochat)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["proxy.py"],
+      "port": 8082
+    },
+    {
+      "name": "Python static server",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8080"],
+      "port": 8080
+    },
+    {
+      "name": "npx serve",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["serve", ".", "--listen", "8081", "--no-clipboard"],
+      "port": 8081
+    }
+  ]
+}
