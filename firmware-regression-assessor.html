@@ -750,8 +750,14 @@ function extractTicketKeys(commits) {
   const commitData = [];
 
   for (const c of commits) {
-    const msg = (c.msg || c.message || '').split('\n')[0];
     const keys = [];
+    // Use pre-computed keys first (email source stores all keys here)
+    for (const k of (c.keys || [])) {
+      if (!seen.has(k)) { seen.add(k); }
+      if (!keys.includes(k)) keys.push(k);
+    }
+    // Also scan msg for any additional keys (git commit source)
+    const msg = (c.msg || c.message || '').split('\n')[0];
     let m;
     keyPattern.lastIndex = 0;
     while ((m = keyPattern.exec(msg)) !== null) {
@@ -906,13 +912,15 @@ function extractEmailItems(content) {
   const keyPattern = /\b([A-Z][A-Z0-9]+-\d+)\b(?!\.)/g;
   const seen = new Set();
   const items = [];
-  // Strip HTML tags if body came back as HTML
+  // Strip HTML tags if body came back as HTML; preserve newlines so line-by-line split works
   const text = content.replace(/<style[\s\S]*?<\/style>/gi, '')
+                       .replace(/<br\s*\/?>/gi, '\n')
+                       .replace(/<\/(?:p|div|li|tr|td|th|h[1-6])>/gi, '\n')
                        .replace(/<[^>]+>/g, ' ')
                        .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&')
                        .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
                        .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n))
-                       .replace(/\s+/g, ' ');
+                       .replace(/[ \t]+/g, ' ');  // collapse spaces/tabs only — preserve \n
   for (const line of text.split(/[\n;]/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -1245,13 +1253,87 @@ async function fetchConfluenceContextViaMcp(modelId, client) {
 }
 
 // ── DIRECT MCP: ZEPHYR TEST CYCLES ───────────────────────
-async function fetchZephyrTestCyclesViaMcp(projectKey, client) {
+async function fetchZephyrTestCyclesViaMcp(projectKey, modelId, client) {
   const tools = await client.listTools();
-  const listTool = tools.find(t => t.name === 'zephyr_list')?.name;
+  const listTool    = tools.find(t => t.name === 'zephyr_list')?.name;
+  const getExecTool = tools.find(t => t.name === 'zephyr_get_executions')?.name;
+  const getCaseTool = tools.find(t => t.name === 'zephyr_get_test_case')?.name;
   if (!listTool) { log('zephyr_list not available', 'info'); return ''; }
 
-  log(`Fetching Zephyr cycles for ${projectKey}...`, 'tool');
-  return client.callTool(listTool, { type: 'cycles', project_key: projectKey, max_results: 50 });
+  const sections = [];
+
+  // Step 1: List folders — find the template folder for this device
+  log(`Finding Zephyr template folder for ${projectKey} (${modelId})…`, 'tool');
+  let templateFolderId = null;
+  try {
+    const foldersRaw = await client.callTool(listTool, { type: 'folders', project_key: projectKey });
+    sections.push(`=== ZEPHYR FOLDERS (${projectKey}) ===\n${foldersRaw}`);
+    log(`Folders: ${foldersRaw.slice(0, 300)}`, 'info');
+
+    // Try to find a folder whose name contains "template", the model ID, or "regression"
+    const keywords = ['template', modelId?.toLowerCase(), 'regression template'];
+    // JSON response: try {"id":...,"name":"..."} in either order
+    const folderEntries = [...foldersRaw.matchAll(/\{[^}]+\}/g)].map(m => m[0]);
+    for (const entry of folderEntries) {
+      const nameMatch = entry.match(/"name"\s*:\s*"([^"]+)"/i);
+      const idMatch   = entry.match(/"id"\s*:\s*"?(-?\d+)"?/i);
+      if (nameMatch && idMatch && keywords.some(k => k && nameMatch[1].toLowerCase().includes(k))) {
+        templateFolderId = idMatch[1];
+        log(`Template folder: "${nameMatch[1]}" (id ${templateFolderId})`, 'success');
+        break;
+      }
+    }
+    if (!templateFolderId) log('No template folder matched — will list all cycles', 'info');
+  } catch (e) {
+    log(`Folder listing failed: ${e.message}`, 'info');
+  }
+
+  // Step 2: List cycles (scoped to template folder when found)
+  log(`Listing cycles in ${projectKey}${templateFolderId ? ' template folder' : ''}…`, 'tool');
+  const cycleParams = { type: 'cycles', project_key: projectKey, max_results: 60 };
+  if (templateFolderId) cycleParams.folder_id = templateFolderId;
+  const cyclesRaw = await client.callTool(listTool, cycleParams);
+  sections.push(`=== TEST CYCLES — ${projectKey}${templateFolderId ? ' (template folder)' : ''} ===\n${cyclesRaw}`);
+  log(`Cycles raw: ${cyclesRaw.length} chars`, 'success');
+
+  // Step 3: Extract cycle IDs and read test cases for each cycle
+  // IDs appear as "id": 123 or "id": "-1" (skip -1, it's the unversioned bucket)
+  const cycleIds = [...cyclesRaw.matchAll(/"id"\s*:\s*"?(-?\d+)"?/g)]
+    .map(m => m[1])
+    .filter(id => id !== '-1' && id !== 'null')
+    .filter((v, i, a) => a.indexOf(v) === i) // deduplicate
+    .slice(0, 10);
+
+  if (!cycleIds.length) {
+    log('No cycle IDs found in Zephyr response', 'info');
+    return sections.join('\n\n');
+  }
+
+  log(`Reading test cases for ${cycleIds.length} cycles…`, 'tool');
+  for (const cycleId of cycleIds) {
+    try {
+      // Try zephyr_get_executions first (returns test cases in the cycle)
+      if (getExecTool) {
+        const execRaw = await client.callTool(getExecTool, {
+          cycle_id: cycleId, project_key: projectKey, max_results: 30
+        });
+        if (execRaw && execRaw.trim().length > 10) {
+          sections.push(`=== CYCLE ${cycleId} — EXECUTIONS ===\n${execRaw.slice(0, 2000)}`);
+          continue;
+        }
+      }
+      // Fallback: zephyr_list type=test_cases for the cycle
+      const tcRaw = await client.callTool(listTool, {
+        type: 'test_cases', cycle_id: cycleId, project_key: projectKey, max_results: 30
+      });
+      if (tcRaw && tcRaw.trim().length > 10)
+        sections.push(`=== CYCLE ${cycleId} — TEST CASES ===\n${tcRaw.slice(0, 2000)}`);
+    } catch (e) {
+      log(`Cycle ${cycleId} read failed: ${e.message}`, 'info');
+    }
+  }
+
+  return sections.join('\n\n');
 }
 
 function primaryProject(ticketKeys) {
@@ -1308,12 +1390,28 @@ function ruleBasedAssess(tickets, commitData, modelId, fwVersion, reposSearched,
     .map(([name, { tickets, score: s }]) => ({ name, risk: s >= 25 ? 'HIGH' : s >= 8 ? 'MEDIUM' : 'LOW', reason: `${tickets.length} ticket${tickets.length !== 1 ? 's' : ''} affect this subsystem`, tickets }))
     .sort((a, b) => O[a.risk] - O[b.risk]);
 
-  const testCases = subsystems.slice(0, 10).map(s => ({
+  // Map subsystem names to cycle names
+  const CYCLE_NAMES = {
+    'MCU / RTOS':         'MCU / RTOS Regression',
+    'Wi-Fi Stack':        'Wi-Fi Regression',
+    'NIM Layer':          'NIM Integration Regression',
+    'BLE Onboarding FSM': 'BLE Onboarding Regression',
+    'Storage / UBI':      'Factory Reset & Storage Integrity',
+    'ERPC Layer':         'ERPC Integration Regression',
+    'OTA Manager':        'FOTA Regression',
+    'Power Manager':      'Sleep / Wakeup & Power Regression',
+    'LED Controller':     'LED & Status Indicator Smoke',
+    'Camera Pipeline':    'Streaming & Camera Pipeline Regression',
+    'Audio Subsystem':    'Audio Regression',
+    'Motion Detection':   'Motion Detection & Smart Alerts Regression',
+  };
+
+  const testCycleRecommendations = subsystems.slice(0, 10).map(s => ({
     priority: s.risk === 'HIGH' ? 'P1' : s.risk === 'MEDIUM' ? 'P2' : 'P3',
-    name: `${s.name} regression`,
-    why: `${s.tickets.join(', ')} modified this subsystem`,
-    subsystem: s.name,
-    related_tickets: s.tickets.slice(0, 3)
+    cycle: CYCLE_NAMES[s.name] || `${s.name} Regression`,
+    reason: `${s.tickets.slice(0, 3).join(', ')} modified this subsystem`,
+    tickets: s.tickets.slice(0, 3),
+    run_type: s.risk === 'HIGH' ? 'full' : s.risk === 'MEDIUM' ? 'regression' : 'smoke'
   }));
 
   const highNames = subsystems.filter(s => s.risk === 'HIGH').map(s => s.name);
@@ -1324,7 +1422,7 @@ function ruleBasedAssess(tickets, commitData, modelId, fwVersion, reposSearched,
     risk_score: score,
     summary: `${modelId} ${fwVersion} — ${tickets.length} tickets across ${repoCount} repo${repoCount !== 1 ? 's' : ''}. Risk score ${score}/100 (${overall}).${highNames.length ? ` High-risk subsystems: ${highNames.join(', ')}.` : ''}`,
     subsystems,
-    test_cases: testCases,
+    test_cycle_recommendations: testCycleRecommendations,
     key_advice: `${p0s.length ? `${p0s.length} P0 ticket(s) (${p0s.map(t => t.key).join(', ')}) — hold release until verified. ` : ''}Focus testing on ${highNames.join(', ') || 'all modified subsystems'}.${repoCount > 1 ? ` Cross-repo blast radius across ${Object.keys(refsUsed).join(', ')} — run integration tests across module boundaries.` : ''}`
   };
 }
@@ -1363,12 +1461,14 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
 ## TICKETS & CODE CHANGES
 ${ticketFullDetails || ticketList}
 
-${confluenceContext ? `## CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 3000)}\n` : ''}
-${hasZephyr ? `## EXISTING ZEPHYR TEST CYCLES\n${zephyrCycles.slice(0, 3000)}\n` : ''}
+${confluenceContext ? `## CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 2000)}\n` : ''}
+${hasZephyr ? `## ZEPHYR TEMPLATE FOLDER — TEST CYCLES & TEST CASES\nThe following data comes from the Zephyr template folder for this device's project. It includes cycle names and the test cases inside each cycle.\n\n${zephyrCycles.slice(0, 6000)}\n` : ''}
 
 Your task:
-1. For each ticket, identify which functional area it affects based on the actual description and code changes.
-2. ${hasZephyr ? 'Cross-reference those functional areas against the Zephyr test cycles listed above. Recommend specific named cycles to re-run, with priority.' : 'Recommend test cases grounded in the actual changes.'}
+1. For each ticket, identify which functional area it affects (e.g. BLE Onboarding, OTA/FOTA, Wi-Fi, Audio, Streaming, Camera Pipeline, MCU/RTOS, Storage, Doorbell, etc.).
+2. ${hasZephyr
+  ? 'Cross-reference those functional areas against the Zephyr template cycles above. Read the test cases listed under each cycle to understand what it actually covers. Then recommend which cycles from the template folder should be executed for this release, ranked by priority. Use the EXACT cycle names from the Zephyr data — do not invent cycle names.'
+  : 'Based on the impacted functional areas, recommend which test cycles should be executed. Use concrete cycle names matching the affected areas (e.g. "BLE Onboarding Regression", "FOTA Regression", "Streaming & 2-Way Talk", "Audio Regression", "Factory Reset", "Sleep/Wakeup Soak", etc.).'}
 3. Assess subsystem risk based on what actually changed.
 
 Return ONLY valid JSON (no markdown fences):
@@ -1379,19 +1479,17 @@ Return ONLY valid JSON (no markdown fences):
   "subsystems": [
     {"name":"<subsystem>","risk":"HIGH"|"MEDIUM"|"LOW","reason":"<max 12 words>","tickets":["KEY-1"]}
   ],
-  ${hasZephyr ? `"test_cycle_recommendations": [
-    {"priority":"P1"|"P2"|"P3","cycle":"<exact cycle name from Zephyr list>","reason":"<which ticket/change drives this>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
-  ],` : ''}
-  "test_cases": [
-    {"priority":"P1"|"P2"|"P3","name":"<specific test>","why":"<1 sentence tied to an actual change>","subsystem":"<name>","related_tickets":["KEY-1"]}
+  "test_cycle_recommendations": [
+    {"priority":"P1"|"P2"|"P3","cycle":"<${hasZephyr ? 'EXACT cycle name from Zephyr template folder' : 'cycle name for the impacted area'}>","reason":"<which ticket/change drives this, max 15 words>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
   ],
   "key_advice": "<3-4 sentences of specific QA guidance for this exact release>"
 }
 
 Rules:
 - subsystems: 4-8 items, risk DESC. Real names: Wi-Fi Stack, BLE Onboarding FSM, NIM Layer, OTA Manager, Power Manager, MCU/RTOS, LED Controller, Camera Pipeline, Audio Subsystem, Storage/UBI, Motion Detection, ERPC Layer.
-- ${hasZephyr ? 'test_cycle_recommendations: use EXACT cycle names from the Zephyr list. P1 first. Only include cycles genuinely relevant to the changes.' : 'test_cases: 8-14 items, P1 first, each grounded in a specific ticket or commit.'}
-- test_cases: 5-8 items covering gaps not addressed by named test cycles.
+- test_cycle_recommendations: ${hasZephyr
+  ? 'ONLY recommend cycles that exist in the Zephyr template folder data above — use their exact names. Exclude cycles whose test cases have no overlap with the changes. P1 = directly touched area, P2 = shared dependency risk, P3 = broad regression safety net.'
+  : '6-12 items covering all impacted functional areas. Every P1 cycle must cite at least one ticket.'} P1 first. run_type: "full" for high-risk areas, "smoke" for low-risk, "regression" for medium.
 - Cross-project shared-code changes push risk_score higher.`;
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -1454,21 +1552,6 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
     </div>`;
   }).join('');
 
-  const tcItems = (assessment.test_cases||[]).map(t=>{
-    const pc = t.priority==='P1'?'tc-p1':t.priority==='P2'?'tc-p2':'tc-p3';
-    return `<div class="tc-item">
-      <span class="tc-pri-badge ${pc}">${t.priority}</span>
-      <div class="tc-body">
-        <div class="tc-name">${t.name}</div>
-        <div class="tc-why">${t.why}</div>
-        <div class="tc-meta">
-          <span class="tc-sub">// ${t.subsystem}</span>
-          ${(t.related_tickets||[]).length?`<span class="tc-ticket">${t.related_tickets.join(', ')}</span>`:''}
-        </div>
-      </div>
-    </div>`;
-  }).join('');
-
   document.getElementById('output').innerHTML = `
     <div class="results">
       <div class="results-header">
@@ -1512,12 +1595,12 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
         <div class="sub-grid">${subCards}</div>
       </div>
 
-      ${(assessment.test_cycle_recommendations||[]).length ? `
       <div class="section">
         <div class="section-header">
-          <span class="section-title">Zephyr test cycles to re-run</span>
-          <span class="section-count">${assessment.test_cycle_recommendations.length}</span>
+          <span class="section-title">Test cycles to execute</span>
+          <span class="section-count">${(assessment.test_cycle_recommendations||[]).length}</span>
         </div>
+        ${(assessment.test_cycle_recommendations||[]).length ? `
         <table class="cycle-table">
           <thead><tr><th>Pri</th><th>Cycle</th><th>Tickets</th><th>Reason</th><th>Run</th></tr></thead>
           <tbody>
@@ -1534,15 +1617,7 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
               </tr>`;
             }).join('')}
           </tbody>
-        </table>
-      </div>` : ''}
-
-      <div class="section">
-        <div class="section-header">
-          <span class="section-title">${(assessment.test_cycle_recommendations||[]).length ? 'Additional test cases' : 'Test cases to prioritize'}</span>
-          <span class="section-count">${(assessment.test_cases||[]).length}</span>
-        </div>
-        <div class="tc-list">${tcItems}</div>
+        </table>` : '<div style="padding:12px;color:var(--hint);font-size:12px">No test cycle recommendations generated.</div>'}
       </div>
 
       <div class="section">
@@ -1586,17 +1661,17 @@ function runDemo() {
         {name:'ERPC Layer',risk:'MEDIUM',reason:'NIM ioctl retry touches ERPC call paths',tickets:['SV-438']},
         {name:'LED Controller',risk:'LOW',reason:'Isolated LED display fix',tickets:['PEGA-1127']},
       ],
-      test_cases:[
-        {priority:'P1',name:'MCU stability soak test (24h)',why:'Two P0 crash fixes require extended uptime validation',subsystem:'MCU / RTOS',related_tickets:['PEGA-1152','PEGA-1142']},
-        {priority:'P1',name:'BLE onboarding end-to-end (50 runs)',why:'NIM ioctl fix + credential race fix both touch the onboarding hot path',subsystem:'BLE Onboarding FSM',related_tickets:['PEGA-979','ARLO-2891']},
-        {priority:'P1',name:'Wi-Fi scan — all band/channel combinations',why:'Shared scan manager change must not regress any product using nim common code',subsystem:'Wi-Fi Stack',related_tickets:['SV-441']},
-        {priority:'P1',name:'NIM ioctl concurrent access stress test',why:'Retry logic fix must hold under simultaneous callers across ERPC boundaries',subsystem:'NIM Layer',related_tickets:['SV-438']},
-        {priority:'P1',name:'Boot cycle stress test (100 cold boots)',why:'Boot-time RTOS crash fix requires boot loop validation',subsystem:'MCU / RTOS',related_tickets:['PEGA-1152']},
-        {priority:'P1',name:'UBI partition integrity after factory reset',why:'ubi_ready frequency change risks corruption after reset',subsystem:'Storage / UBI',related_tickets:['PEGA-1143']},
-        {priority:'P2',name:'Onboarding under RF interference (20 runs)',why:'Wi-Fi + NIM changes should be validated in noisy RF environments',subsystem:'Wi-Fi Stack',related_tickets:['SV-441','PEGA-979']},
-        {priority:'P2',name:'Cross-SKU regression on nim common library',why:'nim changes affect all products — run regression on all affected SKUs',subsystem:'NIM Layer',related_tickets:['SV-441','SV-438']},
-        {priority:'P2',name:'ERPC call timeout under load',why:'NIM retry changes could mask ERPC timeouts in high-traffic scenarios',subsystem:'ERPC Layer',related_tickets:['SV-438']},
-        {priority:'P3',name:'Battery LED across all charge level transitions',why:'Isolated fix but all threshold transitions should be confirmed',subsystem:'LED Controller',related_tickets:['PEGA-1127']},
+      test_cycle_recommendations:[
+        {priority:'P1',cycle:'MCU / RTOS Soak (24h)',reason:'Two P0 crash fixes — PEGA-1152 & PEGA-1142 — require extended uptime validation',tickets:['PEGA-1152','PEGA-1142'],run_type:'full'},
+        {priority:'P1',cycle:'BLE Onboarding Regression',reason:'NIM ioctl fix + credential race both touch the onboarding hot path',tickets:['PEGA-979','ARLO-2891'],run_type:'full'},
+        {priority:'P1',cycle:'Wi-Fi Regression',reason:'Shared scan manager change must not regress any SKU using nim common code',tickets:['SV-441'],run_type:'full'},
+        {priority:'P1',cycle:'NIM Concurrent Access Stress',reason:'Retry logic must hold under simultaneous ERPC callers',tickets:['SV-438'],run_type:'full'},
+        {priority:'P1',cycle:'Boot Cycle Stress (100 cold boots)',reason:'Boot-time RTOS crash fix requires boot loop validation',tickets:['PEGA-1152'],run_type:'full'},
+        {priority:'P1',cycle:'Factory Reset & UBI Integrity',reason:'ubi_ready frequency change risks partition corruption after reset',tickets:['PEGA-1143'],run_type:'regression'},
+        {priority:'P2',cycle:'RF Interference Onboarding (20 runs)',reason:'Wi-Fi + NIM changes should be validated in noisy RF environments',tickets:['SV-441','PEGA-979'],run_type:'regression'},
+        {priority:'P2',cycle:'Cross-SKU NIM Regression',reason:'nim changes affect all products — validate against every SKU pulling from that codebase',tickets:['SV-441','SV-438'],run_type:'regression'},
+        {priority:'P2',cycle:'ERPC Timeout Under Load',reason:'NIM retry changes could mask ERPC timeouts in high-traffic scenarios',tickets:['SV-438'],run_type:'smoke'},
+        {priority:'P3',cycle:'Battery & LED Smoke',reason:'Isolated LED fix — verify all charge level transitions',tickets:['PEGA-1127'],run_type:'smoke'},
       ],
       key_advice:'The nim shared library changes (SV-441, SV-438) are the highest cross-repo risk — validate against every SKU pulling from that codebase before release. For PEGA, the two P0 MCU crash fixes warrant a 48-hour soak minimum. Run the BLE onboarding suite under load and RF interference together since ARLO-2891 and PEGA-979 interact at the credential-write/NIM boundary. Hold field deployment until UBI and RTOS soak results are clean.'
     },
@@ -1650,7 +1725,7 @@ async function runAssessment() {
       'Connecting to Arlochat MCP',
       step1Label,
       'Jira: full ticket details',
-      'Confluence + Zephyr: docs + test cycles',
+      'Confluence + Zephyr: docs + template test cycles',
       anthropicKey ? 'Claude AI risk analysis' : 'Rule-based risk analysis'
     ]);
     const client = new McpClient(
@@ -1677,7 +1752,7 @@ async function runAssessment() {
       const projKey = primaryProject(ticketKeys);
       const [confluenceContext, zephyrCycles] = await Promise.all([
         fetchConfluenceContextViaMcp(modelId, client).catch(() => ''),
-        fetchZephyrTestCyclesViaMcp(projKey, client).catch(() => '')
+        fetchZephyrTestCyclesViaMcp(projKey, modelId, client).catch(() => '')
       ]);
       log(`Confluence: ${confluenceContext.length} chars | Zephyr: ${zephyrCycles.length} chars`, 'info');
 
