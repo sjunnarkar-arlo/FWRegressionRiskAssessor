@@ -902,11 +902,17 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
 
 // ── EMAIL HELPERS ────────────────────────────────────────
 function extractEmailItems(content) {
-  const keyPattern = /\b([A-Z][A-Z0-9]+-\d+)\b/g;
+  // (?!\.) excludes firmware version strings like AVD6001-0.100.159
+  const keyPattern = /\b([A-Z][A-Z0-9]+-\d+)\b(?!\.)/g;
   const seen = new Set();
   const items = [];
   // Strip HTML tags if body came back as HTML
-  const text = content.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
+  const text = content.replace(/<style[\s\S]*?<\/style>/gi, '')
+                       .replace(/<[^>]+>/g, ' ')
+                       .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&')
+                       .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+                       .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n))
+                       .replace(/\s+/g, ' ');
   for (const line of text.split(/[\n;]/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -920,6 +926,7 @@ function extractEmailItems(content) {
     if (keys.length) items.push({ sha: '—', msg: trimmed.slice(0, 200), repo: 'release-notes', keys });
   }
   if (!items.length) throw new Error('No Jira ticket keys (e.g. PEGA-123) found in the release notes.');
+  log(`Found ${seen.size} ticket keys: ${[...seen].slice(0, 10).join(', ')}${seen.size > 10 ? ` … (+${seen.size - 10} more)` : ''}`, 'success');
   return { source: 'email', commits: items, repos_searched: ['email-release-notes'], refs_used: { 'email-release-notes': 'release-notes' } };
 }
 
@@ -1169,11 +1176,31 @@ async function fetchJiraDetailsViaMcp(ticketKeys, client) {
     return { tickets: normalizeJiraResults(raw, ticketKeys), fullDetails: raw };
   }
 
-  const tickets = [], detailParts = [];
   const extractProject = k => k.replace(/-\d+$/, '');
   const normPri = v => { const s = (v||'').toUpperCase(); return s.includes('BLOCKER')||s==='P0'?'P0':s.includes('CRITICAL')||s==='P1'?'P1':s.includes('MINOR')||s==='P3'?'P3':'P2'; };
 
-  for (const key of ticketKeys.slice(0, 20)) {
+  // For large sets (>20 tickets) use batched jira_search instead of one-by-one reads
+  if (ticketKeys.length > 20) {
+    log(`${ticketKeys.length} tickets — using batched jira_search`, 'info');
+    const CHUNK = 30;
+    const tickets = [], detailParts = [];
+    for (let i = 0; i < ticketKeys.length; i += CHUNK) {
+      const chunk = ticketKeys.slice(i, i + CHUNK);
+      log(`Searching Jira for tickets ${i + 1}–${i + chunk.length} of ${ticketKeys.length}…`, 'tool');
+      const raw = await client.callTool(searchTool, {
+        jql: `issueKey in (${chunk.map(k => `"${k}"`).join(',')}) ORDER BY priority ASC`,
+        fields: 'summary,priority,status,assignee',
+        limit: chunk.length + 5
+      });
+      detailParts.push(raw);
+      tickets.push(...normalizeJiraResults(raw, chunk));
+    }
+    return { tickets, fullDetails: detailParts.join('\n\n') };
+  }
+
+  // For small sets: read one-by-one for richer detail
+  const tickets = [], detailParts = [];
+  for (const key of ticketKeys) {
     log(`Reading ${key}`, 'tool');
     const raw = await client.callTool(readTool, { issue_key: key, include_comments: false });
     detailParts.push(`=== ${key} ===\n${raw.slice(0, 3000)}`);
@@ -1690,7 +1717,77 @@ document.getElementById('data-source').addEventListener('change', function() {
   document.getElementById('email-paste-field').style.display = isEmail ? 'block' : 'none';
 });
 
-// File input: read .eml/.txt into textarea; warn on .msg
+// ── EML MIME PARSER ──────────────────────────────────────────
+function parseEmlToText(raw) {
+  const norm = s => s.replace(/\r\n/g, '\n');
+
+  function parseHeaders(block) {
+    const h = {};
+    for (let i = 0, lines = norm(block).split('\n'); i < lines.length; i++) {
+      const m = lines[i].match(/^([\w-]+):\s*(.*)/);
+      if (!m) continue;
+      let val = m[2];
+      while (i + 1 < lines.length && /^\s/.test(lines[i + 1])) val += ' ' + lines[++i].trim();
+      h[m[1].toLowerCase()] = val;
+    }
+    return h;
+  }
+
+  function decodeQP(s) {
+    return norm(s).replace(/=\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+  }
+
+  function decodeB64(s) { try { return atob(s.replace(/\s+/g, '')); } catch { return s; } }
+
+  function stripHtml(h) {
+    return h.replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<script[\s\S]*?<\/script>/gi, '')
+            .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&')
+            .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n))
+            .replace(/ {2,}/g, ' ').trim();
+  }
+
+  function splitPart(raw) {
+    const n = norm(raw), blank = n.indexOf('\n\n');
+    if (blank === -1) return { headers: {}, body: n };
+    return { headers: parseHeaders(n.slice(0, blank)), body: n.slice(blank + 2) };
+  }
+
+  function processPart(raw) {
+    const { headers, body } = splitPart(raw);
+    const ctRaw = headers['content-type'] || 'text/plain'; // preserve case for boundary
+    const ct    = ctRaw.toLowerCase();
+    const enc   = (headers['content-transfer-encoding'] || '').toLowerCase().trim();
+    let decoded = body;
+    if (enc === 'quoted-printable') decoded = decodeQP(body);
+    else if (enc === 'base64')      decoded = decodeB64(body);
+    const bm = ctRaw.match(/boundary=["']?([^"';\s\r\n]+)["']?/i);
+    if (ct.includes('multipart') && bm) return processMultipart(decoded, bm[1]);
+    if (ct.includes('text/plain'))      return decoded;
+    if (ct.includes('text/html'))       return stripHtml(decoded);
+    return '';
+  }
+
+  function processMultipart(body, boundary) {
+    const esc = boundary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const parts = ('\n' + norm(body)).split(new RegExp('\n--' + esc));
+    const texts = [], htmls = [];
+    for (const part of parts.slice(1)) {
+      if (/^--/.test(part.trim())) continue;
+      const clean = part.replace(/^\n/, '');
+      const { headers } = splitPart(clean);
+      const pct = (headers['content-type'] || '').toLowerCase();
+      const result = processPart(clean);
+      if (!result) continue;
+      if (pct.includes('text/plain'))  texts.push(result);
+      else if (pct.includes('text/html') || pct.includes('multipart')) htmls.push(result);
+    }
+    return texts.join('\n') || htmls.join('\n');
+  }
+
+  return processPart(raw);
+}
+
+// File input: read .eml/.msg/.txt into textarea
 document.getElementById('release-notes-file').addEventListener('change', function(e) {
   const file = e.target.files[0];
   if (!file) return;
@@ -1698,24 +1795,30 @@ document.getElementById('release-notes-file').addEventListener('change', functio
   nameEl.textContent = file.name;
   nameEl.style.color = 'var(--accent)';
 
-  if (file.name.toLowerCase().endsWith('.msg')) {
-    document.getElementById('email-content').placeholder =
-      '.msg (Outlook binary) cannot be read as text. Export as .eml or copy-paste the body below.';
-    return;
-  }
-
   const reader = new FileReader();
   reader.onload = function(ev) {
     let content = ev.target.result;
-    if (file.name.toLowerCase().endsWith('.eml')) {
-      const crlf = content.indexOf('\r\n\r\n');
-      const lf   = content.indexOf('\n\n');
-      const sep  = crlf !== -1 ? crlf + 4 : lf !== -1 ? lf + 2 : 0;
-      content = content.slice(sep);
+    const lower = file.name.toLowerCase();
+    if (lower.endsWith('.eml')) {
+      content = parseEmlToText(content);
+    } else if (lower.endsWith('.msg')) {
+      // OLE2/Outlook .msg: HTML body is embedded as readable text — extract it
+      const htmlStart = content.search(/<html[\s>]/i);
+      const htmlEnd   = content.search(/<\/html>/i);
+      if (htmlStart !== -1) {
+        const chunk = htmlEnd !== -1 ? content.slice(htmlStart, htmlEnd + 7) : content.slice(htmlStart);
+        content = chunk.replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<script[\s\S]*?<\/script>/gi, '')
+                       .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&')
+                       .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n))
+                       .replace(/ {2,}/g, ' ').trim();
+      } else {
+        content = content.replace(/[^\x20-\x7E\n]/g, ' ').replace(/ {2,}/g, ' ');
+      }
     }
     document.getElementById('email-content').value = content;
+    nameEl.title = `Extracted ${content.length} characters from ${file.name}`;
   };
-  reader.readAsText(file);
+  reader.readAsText(file, 'latin1');
 });
 
 // Drag-and-drop on the drop-zone label
