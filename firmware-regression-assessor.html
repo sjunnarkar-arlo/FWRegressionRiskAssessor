@@ -834,7 +834,7 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
 
   // Find all repos in org
   const repoRaw = await client.callTool(ghTool, {
-    command: `gh repo list arlo-engineering --limit 200 --json name --jq '[.[].name]'`
+    command: `repo list arlo-engineering --limit 200 --json name --jq '[.[].name]'`
   });
   let allRepoNames = [];
   try { allRepoNames = JSON.parse(repoRaw); } catch {}
@@ -854,14 +854,14 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
 
   for (const repo of candidates) {
     // Find ref matching fwVersion
-    const tagsRaw = await client.callTool(ghTool, { command: `gh api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
+    const tagsRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
     let ref = 'master';
     try {
       const tags = JSON.parse(tagsRaw);
       const match = tags.find(t => t.includes(fwVersion) || fwVersion.includes(t.replace(/^v/, '')));
       if (match) { ref = match; }
       else {
-        const brRaw = await client.callTool(ghTool, { command: `gh api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
+        const brRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
         const branches = JSON.parse(brRaw || '[]');
         const bMatch = branches.find(b => b.includes(fwVersion)) || branches.find(b => b.includes('release'));
         if (bMatch) ref = bMatch;
@@ -869,7 +869,7 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
     } catch {}
 
     const commitsRaw = await client.callTool(ghTool, {
-      command: `gh api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
+      command: `api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
     });
     try {
       const parsed = JSON.parse(commitsRaw);
