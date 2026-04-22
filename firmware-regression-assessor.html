@@ -1245,13 +1245,87 @@ async function fetchConfluenceContextViaMcp(modelId, client) {
 }
 
 // ── DIRECT MCP: ZEPHYR TEST CYCLES ───────────────────────
-async function fetchZephyrTestCyclesViaMcp(projectKey, client) {
+async function fetchZephyrTestCyclesViaMcp(projectKey, modelId, client) {
   const tools = await client.listTools();
-  const listTool = tools.find(t => t.name === 'zephyr_list')?.name;
+  const listTool    = tools.find(t => t.name === 'zephyr_list')?.name;
+  const getExecTool = tools.find(t => t.name === 'zephyr_get_executions')?.name;
+  const getCaseTool = tools.find(t => t.name === 'zephyr_get_test_case')?.name;
   if (!listTool) { log('zephyr_list not available', 'info'); return ''; }
 
-  log(`Fetching Zephyr cycles for ${projectKey}...`, 'tool');
-  return client.callTool(listTool, { type: 'cycles', project_key: projectKey, max_results: 50 });
+  const sections = [];
+
+  // Step 1: List folders — find the template folder for this device
+  log(`Finding Zephyr template folder for ${projectKey} (${modelId})…`, 'tool');
+  let templateFolderId = null;
+  try {
+    const foldersRaw = await client.callTool(listTool, { type: 'folders', project_key: projectKey });
+    sections.push(`=== ZEPHYR FOLDERS (${projectKey}) ===\n${foldersRaw}`);
+    log(`Folders: ${foldersRaw.slice(0, 300)}`, 'info');
+
+    // Try to find a folder whose name contains "template", the model ID, or "regression"
+    const keywords = ['template', modelId?.toLowerCase(), 'regression template'];
+    // JSON response: try {"id":...,"name":"..."} in either order
+    const folderEntries = [...foldersRaw.matchAll(/\{[^}]+\}/g)].map(m => m[0]);
+    for (const entry of folderEntries) {
+      const nameMatch = entry.match(/"name"\s*:\s*"([^"]+)"/i);
+      const idMatch   = entry.match(/"id"\s*:\s*"?(-?\d+)"?/i);
+      if (nameMatch && idMatch && keywords.some(k => k && nameMatch[1].toLowerCase().includes(k))) {
+        templateFolderId = idMatch[1];
+        log(`Template folder: "${nameMatch[1]}" (id ${templateFolderId})`, 'success');
+        break;
+      }
+    }
+    if (!templateFolderId) log('No template folder matched — will list all cycles', 'info');
+  } catch (e) {
+    log(`Folder listing failed: ${e.message}`, 'info');
+  }
+
+  // Step 2: List cycles (scoped to template folder when found)
+  log(`Listing cycles in ${projectKey}${templateFolderId ? ' template folder' : ''}…`, 'tool');
+  const cycleParams = { type: 'cycles', project_key: projectKey, max_results: 60 };
+  if (templateFolderId) cycleParams.folder_id = templateFolderId;
+  const cyclesRaw = await client.callTool(listTool, cycleParams);
+  sections.push(`=== TEST CYCLES — ${projectKey}${templateFolderId ? ' (template folder)' : ''} ===\n${cyclesRaw}`);
+  log(`Cycles raw: ${cyclesRaw.length} chars`, 'success');
+
+  // Step 3: Extract cycle IDs and read test cases for each cycle
+  // IDs appear as "id": 123 or "id": "-1" (skip -1, it's the unversioned bucket)
+  const cycleIds = [...cyclesRaw.matchAll(/"id"\s*:\s*"?(-?\d+)"?/g)]
+    .map(m => m[1])
+    .filter(id => id !== '-1' && id !== 'null')
+    .filter((v, i, a) => a.indexOf(v) === i) // deduplicate
+    .slice(0, 10);
+
+  if (!cycleIds.length) {
+    log('No cycle IDs found in Zephyr response', 'info');
+    return sections.join('\n\n');
+  }
+
+  log(`Reading test cases for ${cycleIds.length} cycles…`, 'tool');
+  for (const cycleId of cycleIds) {
+    try {
+      // Try zephyr_get_executions first (returns test cases in the cycle)
+      if (getExecTool) {
+        const execRaw = await client.callTool(getExecTool, {
+          cycle_id: cycleId, project_key: projectKey, max_results: 30
+        });
+        if (execRaw && execRaw.trim().length > 10) {
+          sections.push(`=== CYCLE ${cycleId} — EXECUTIONS ===\n${execRaw.slice(0, 2000)}`);
+          continue;
+        }
+      }
+      // Fallback: zephyr_list type=test_cases for the cycle
+      const tcRaw = await client.callTool(listTool, {
+        type: 'test_cases', cycle_id: cycleId, project_key: projectKey, max_results: 30
+      });
+      if (tcRaw && tcRaw.trim().length > 10)
+        sections.push(`=== CYCLE ${cycleId} — TEST CASES ===\n${tcRaw.slice(0, 2000)}`);
+    } catch (e) {
+      log(`Cycle ${cycleId} read failed: ${e.message}`, 'info');
+    }
+  }
+
+  return sections.join('\n\n');
 }
 
 function primaryProject(ticketKeys) {
@@ -1379,13 +1453,13 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
 ## TICKETS & CODE CHANGES
 ${ticketFullDetails || ticketList}
 
-${confluenceContext ? `## CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 3000)}\n` : ''}
-${hasZephyr ? `## EXISTING ZEPHYR TEST CYCLES\n${zephyrCycles.slice(0, 3000)}\n` : ''}
+${confluenceContext ? `## CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 2000)}\n` : ''}
+${hasZephyr ? `## ZEPHYR TEMPLATE FOLDER — TEST CYCLES & TEST CASES\nThe following data comes from the Zephyr template folder for this device's project. It includes cycle names and the test cases inside each cycle.\n\n${zephyrCycles.slice(0, 6000)}\n` : ''}
 
 Your task:
 1. For each ticket, identify which functional area it affects (e.g. BLE Onboarding, OTA/FOTA, Wi-Fi, Audio, Streaming, Camera Pipeline, MCU/RTOS, Storage, Doorbell, etc.).
 2. ${hasZephyr
-  ? 'Cross-reference those functional areas against the EXISTING ZEPHYR TEST CYCLES listed above. Recommend which specific named cycles to execute for this release, ranked by priority. Use EXACT cycle names from the list.'
+  ? 'Cross-reference those functional areas against the Zephyr template cycles above. Read the test cases listed under each cycle to understand what it actually covers. Then recommend which cycles from the template folder should be executed for this release, ranked by priority. Use the EXACT cycle names from the Zephyr data — do not invent cycle names.'
   : 'Based on the impacted functional areas, recommend which test cycles should be executed. Use concrete cycle names matching the affected areas (e.g. "BLE Onboarding Regression", "FOTA Regression", "Streaming & 2-Way Talk", "Audio Regression", "Factory Reset", "Sleep/Wakeup Soak", etc.).'}
 3. Assess subsystem risk based on what actually changed.
 
@@ -1398,14 +1472,16 @@ Return ONLY valid JSON (no markdown fences):
     {"name":"<subsystem>","risk":"HIGH"|"MEDIUM"|"LOW","reason":"<max 12 words>","tickets":["KEY-1"]}
   ],
   "test_cycle_recommendations": [
-    {"priority":"P1"|"P2"|"P3","cycle":"<${hasZephyr ? 'exact cycle name from Zephyr list' : 'cycle name for the impacted area'}>","reason":"<which ticket/change drives this, max 15 words>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
+    {"priority":"P1"|"P2"|"P3","cycle":"<${hasZephyr ? 'EXACT cycle name from Zephyr template folder' : 'cycle name for the impacted area'}>","reason":"<which ticket/change drives this, max 15 words>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
   ],
   "key_advice": "<3-4 sentences of specific QA guidance for this exact release>"
 }
 
 Rules:
 - subsystems: 4-8 items, risk DESC. Real names: Wi-Fi Stack, BLE Onboarding FSM, NIM Layer, OTA Manager, Power Manager, MCU/RTOS, LED Controller, Camera Pipeline, Audio Subsystem, Storage/UBI, Motion Detection, ERPC Layer.
-- test_cycle_recommendations: ${hasZephyr ? 'use EXACT cycle names from the Zephyr list. Only include cycles genuinely relevant to the changes.' : '6-12 items covering all impacted functional areas. Every P1 cycle must cite at least one ticket.'} P1 first. run_type: "full" for high-risk areas, "smoke" for low-risk, "regression" for medium.
+- test_cycle_recommendations: ${hasZephyr
+  ? 'ONLY recommend cycles that exist in the Zephyr template folder data above — use their exact names. Exclude cycles whose test cases have no overlap with the changes. P1 = directly touched area, P2 = shared dependency risk, P3 = broad regression safety net.'
+  : '6-12 items covering all impacted functional areas. Every P1 cycle must cite at least one ticket.'} P1 first. run_type: "full" for high-risk areas, "smoke" for low-risk, "regression" for medium.
 - Cross-project shared-code changes push risk_score higher.`;
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -1641,7 +1717,7 @@ async function runAssessment() {
       'Connecting to Arlochat MCP',
       step1Label,
       'Jira: full ticket details',
-      'Confluence + Zephyr: docs + test cycles',
+      'Confluence + Zephyr: docs + template test cycles',
       anthropicKey ? 'Claude AI risk analysis' : 'Rule-based risk analysis'
     ]);
     const client = new McpClient(
@@ -1668,7 +1744,7 @@ async function runAssessment() {
       const projKey = primaryProject(ticketKeys);
       const [confluenceContext, zephyrCycles] = await Promise.all([
         fetchConfluenceContextViaMcp(modelId, client).catch(() => ''),
-        fetchZephyrTestCyclesViaMcp(projKey, client).catch(() => '')
+        fetchZephyrTestCyclesViaMcp(projKey, modelId, client).catch(() => '')
       ]);
       log(`Confluence: ${confluenceContext.length} chars | Zephyr: ${zephyrCycles.length} chars`, 'info');
 
