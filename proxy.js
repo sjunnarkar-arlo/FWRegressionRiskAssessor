@@ -107,9 +107,13 @@ function proxyPost(req, res) {
         const parts = [];
         upRes.on('data', (c) => parts.push(c));
         upRes.on('end', () => {
+          const responseBody = Buffer.concat(parts);
+          if (upRes.statusCode >= 400) {
+            console.error(`[proxy] POST upstream ${upRes.statusCode} ${targetPath}:`, responseBody.toString('utf8').slice(0, 300));
+          }
           cors(res);
           res.writeHead(upRes.statusCode);
-          res.end(Buffer.concat(parts));
+          res.end(responseBody);
         });
       }
     );

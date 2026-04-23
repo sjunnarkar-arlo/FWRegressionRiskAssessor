@@ -433,6 +433,14 @@
     <input type="hidden" id="fw-version" />
 
     <div class="sidebar-section">
+      <div class="sidebar-label">Release info</div>
+      <div class="field">
+        <label>SW / Client Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
+        <input type="text" id="sw-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
+      </div>
+    </div>
+
+    <div class="sidebar-section">
       <div class="sidebar-label">Data source</div>
       <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:10px;background:var(--bg3);border:1px solid var(--border2);border-radius:6px">
         <input type="checkbox" id="use-mcp" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer" />
@@ -555,7 +563,21 @@ class McpClient {
       const t = setTimeout(() => rej(new Error('MCP endpoint timeout (30s) — is VPN on and proxy.js running?')), 30000);
       this._onEndpoint = url => { clearTimeout(t); this.sessionUrl = url; res(); };
     });
-    await this._rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'fw-regression-assessor', version: '1.0' } });
+    // Small delay so the server-side session is fully registered before the first RPC
+    await new Promise(r => setTimeout(r, 300));
+    let initErr;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 1000));
+        await this._rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'fw-regression-assessor', version: '1.0' } });
+        initErr = null;
+        break;
+      } catch (e) {
+        initErr = e;
+        if (!e.message.includes('502')) break;
+      }
+    }
+    if (initErr) throw new Error(initErr.message + ' — check proxy.js console for details');
     await this._notify('notifications/initialized');
     this.onLog('MCP handshake complete', 'success');
   }
@@ -1351,9 +1373,10 @@ async function sigV4Headers(method, url, bodyStr, keyId, secret, token, region) 
   return hdrs;
 }
 
-async function bedrockInvoke(url, messages, tools, bedrockCreds) {
+async function bedrockInvoke(url, messages, tools, bedrockCreds, system) {
   const { keyId, secret, token, region, bedrockModel } = bedrockCreds;
   const bodyObj = { anthropic_version: 'bedrock-2023-05-31', max_tokens: 8000, messages };
+  if (system) bodyObj.system = system;
   if (tools && tools.length) bodyObj.tools = tools;
   const body = JSON.stringify(bodyObj);
   const hdrs = await sigV4Headers('POST', url, body, keyId, secret, token || null, region);
@@ -1363,7 +1386,7 @@ async function bedrockInvoke(url, messages, tools, bedrockCreds) {
 }
 
 async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearched, refsUsed, bedrockCreds, extras = {}) {
-  const { ticketFullDetails = '', projKey = '' } = extras;
+  const { ticketFullDetails = '', projKey = '', swVersion = '' } = extras;
   const repoSummary = Object.entries(refsUsed||{}).map(([r,ref]) => `${r}@${ref}`).join(', ') || reposSearched.join(', ');
   const client = extras.mcpClient || null;
 
@@ -1458,7 +1481,7 @@ Rules:
 - coverage_gaps: list functional areas touched by tickets that have NO matching Zephyr cycle. Empty array if everything is covered.
 - Cross-project shared-code changes push risk_score higher.`;
 
-  const userContent = `Analyze this firmware release for model "${modelId}" version "${fwVersion}" (repos: ${repoSummary}).
+  const userContent = `Analyze this firmware release for model "${modelId}" version "${fwVersion}"${swVersion ? ` (SW/client version: ${swVersion})` : ''} (repos: ${repoSummary}).
 
 ## TICKETS & CODE CHANGES
 ${ticketFullDetails || ticketList}
@@ -1467,12 +1490,14 @@ ${projKey ? `Jira project key: ${projKey}` : ''}`;
 
   const messages = [{ role: 'user', content: userContent }];
 
-  let data = await bedrockInvoke(url, messages, tools.length ? tools : undefined, creds);
+  let data = await bedrockInvoke(url, messages, tools.length ? tools : undefined, creds, systemPrompt);
   log(`Bedrock turn 1: stop_reason=${data.stop_reason}`, 'info');
 
   // Agentic tool-use loop — Bedrock drives Zephyr/Confluence queries
+  // Stop passing tools after 7 turns to force the model to conclude
+  const MAX_TURNS = 10;
   let turns = 0;
-  while (data.stop_reason === 'tool_use' && turns < 15) {
+  while (data.stop_reason === 'tool_use' && turns < MAX_TURNS) {
     turns++;
     const assistantContent = data.content || [];
     messages.push({ role: 'assistant', content: assistantContent });
@@ -1491,14 +1516,24 @@ ${projKey ? `Jira project key: ${projKey}` : ''}`;
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result });
     }
 
+    // After 7 tool-use rounds, withhold tools so the model must produce the final JSON
+    const nextTools = turns >= 7 ? undefined : tools;
     messages.push({ role: 'user', content: toolResults });
-    data = await bedrockInvoke(url, messages, tools, creds);
+    data = await bedrockInvoke(url, messages, nextTools, creds, systemPrompt);
     log(`Bedrock turn ${turns + 1}: stop_reason=${data.stop_reason}`, 'info');
   }
 
   const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-  const parsed = parseJsonFromText(raw);
-  if (!parsed) throw new Error('Could not parse risk assessment from Bedrock response');
+  let parsed = parseJsonFromText(raw);
+  if (!parsed) {
+    log('Response was not JSON — sending recovery prompt', 'info');
+    messages.push({ role: 'assistant', content: data.content?.length ? data.content : [{ type: 'text', text: raw || '...' }] });
+    messages.push({ role: 'user', content: 'Output ONLY the JSON object now. Start with { and end with }. No preamble, no markdown fences, no explanation.' });
+    const recovery = await bedrockInvoke(url, messages, undefined, creds, systemPrompt);
+    const recoveryRaw = (recovery.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    parsed = parseJsonFromText(recoveryRaw);
+    if (!parsed) throw new Error('Could not parse risk assessment from Bedrock response');
+  }
   return parsed;
 }
 
@@ -1700,6 +1735,7 @@ function runDemo() {
 async function runAssessment() {
   const modelId      = document.getElementById('model-id').value.trim();
   const fwVersion    = document.getElementById('fw-version').value.trim();
+  const swVersion    = document.getElementById('sw-version').value.trim();
   const useMcp       = document.getElementById('use-mcp').checked;
   const bedrockCreds = (() => {
     const keyId  = document.getElementById('bedrock-key-id').value.trim();
@@ -1772,7 +1808,7 @@ async function runAssessment() {
       if (bedrockCreds) {
         // Bedrock drives Zephyr + Confluence queries itself via tool use
         activateStep(4);
-        assessment = await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, bedrockCreds, { ticketFullDetails: fullDetails, projKey, mcpClient: client });
+        assessment = await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, bedrockCreds, { ticketFullDetails: fullDetails, projKey, mcpClient: client, swVersion });
       } else {
         // Rule-based: pre-fetch Zephyr + Confluence and score locally
         const [confluenceContext, zephyrCycles] = await Promise.all([
