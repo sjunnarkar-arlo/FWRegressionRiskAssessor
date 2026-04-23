@@ -1862,8 +1862,10 @@ async function runAssessment() {
         : await discoverCommitsViaMcp(modelId, fwVersion, client, { iosVersion, androidVersion, webVersion });
       let { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
 
-      // Fallback: if no ticket keys found in commits, search Jira per client version
-      if (!ticketKeys.length && (iosVersion || androidVersion || webVersion)) {
+      // Fallback: search Jira only when the repo returned zero commits (bad version/branch).
+      // If commits exist but have no Jira keys, don't fall back — a fixVersion search
+      // would return tickets from all platforms sharing the same version number.
+      if (!ticketKeys.length && discovered.commits.length === 0 && (iosVersion || androidVersion || webVersion)) {
         const jiraTool = (await client.listTools()).find(t => t.name === 'jira_search')?.name || 'jira_search';
         const seenKeys = new Set(ticketKeys);
         for (const ver of [iosVersion, androidVersion, webVersion].filter(Boolean)) {
