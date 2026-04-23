@@ -1359,7 +1359,7 @@ async function bedrockInvoke(url, messages, tools, bedrockCreds, system) {
   const body = JSON.stringify(bodyObj);
   const hdrs = await sigV4Headers('POST', url, body, keyId, secret, token || null, region);
   const resp = await fetch(url, { method: 'POST', headers: hdrs, body });
-  if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.message || e['message'] || `Bedrock error ${resp.status}`); }
+  if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(`Bedrock ${resp.status}: ${e.message || e['message'] || JSON.stringify(e) || 'unknown error'}`); }
   return resp.json();
 }
 
@@ -1459,10 +1459,16 @@ Rules:
 - coverage_gaps: list functional areas touched by tickets that have NO matching Zephyr cycle. Empty array if everything is covered.
 - Cross-project shared-code changes push risk_score higher.`;
 
+  const DETAIL_CAP = 30000;
+  const ticketContext = ticketFullDetails
+    ? ticketFullDetails.slice(0, DETAIL_CAP) + (ticketFullDetails.length > DETAIL_CAP ? `\n\n[truncated — ${ticketFullDetails.length - DETAIL_CAP} chars omitted; summary list follows]\n${ticketList}` : '')
+    : ticketList;
+  log(`Ticket context for Bedrock: ${ticketContext.length} chars`, 'info');
+
   const userContent = `Analyze this firmware release for model "${modelId}" version "${fwVersion}" (repos: ${repoSummary}).
 
 ## TICKETS & CODE CHANGES
-${ticketFullDetails || ticketList}
+${ticketContext}
 
 ${projKey ? `Jira project key: ${projKey}` : ''}`;
 
