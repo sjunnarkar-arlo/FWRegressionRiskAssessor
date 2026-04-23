@@ -1604,19 +1604,8 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
       <div class="summary-banner ${rC}">${assessment.summary}</div>
 
       <div class="section">
-        <div class="section-header">
-          <span class="section-title">${sourceType === 'email' ? 'Release note items' : 'Commits scanned'}</span>
-          <span class="section-count">${commitData.length} with ticket refs</span>
-        </div>
-        <div style="font-family:var(--mono)">${commitStrip}</div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span class="section-title">Tickets in this release</span>
-          <span class="section-count">${tickets.length}</span>
-        </div>
-        <div class="ticket-list">${ticketRows}</div>
+        <div class="section-header"><span class="section-title">QA advice</span></div>
+        <div class="advice-box"><p>${assessment.key_advice}</p></div>
       </div>
 
       <div class="section">
@@ -1671,8 +1660,19 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
       </div>` : ''}
 
       <div class="section">
-        <div class="section-header"><span class="section-title">QA advice</span></div>
-        <div class="advice-box"><p>${assessment.key_advice}</p></div>
+        <div class="section-header">
+          <span class="section-title">Tickets in this release</span>
+          <span class="section-count">${tickets.length}</span>
+        </div>
+        <div class="ticket-list">${ticketRows}</div>
+      </div>
+
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">${sourceType === 'email' ? 'Release note items' : 'Commits scanned'}</span>
+          <span class="section-count">${commitData.length} with ticket refs</span>
+        </div>
+        <div style="font-family:var(--mono)">${commitStrip}</div>
       </div>
     </div>`;
 }
