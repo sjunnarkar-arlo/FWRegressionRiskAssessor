@@ -433,11 +433,11 @@
       <div class="sidebar-label">Release</div>
       <div class="field">
         <label>Model ID</label>
-        <input type="text" id="model-id" placeholder="e.g. VMC4040P, Lory, Harpy" value="AVD6001" />
+        <input type="text" id="model-id" placeholder="Auto-filled from email" />
       </div>
       <div class="field">
         <label>FW Version</label>
-        <input type="text" id="fw-version" placeholder="e.g. 1.130.18.0" value="0.100.159_b075390" />
+        <input type="text" id="fw-version" placeholder="Auto-filled from email" />
       </div>
     </div>
 
@@ -1862,6 +1862,29 @@ function parseEmlToText(raw) {
   return processPart(raw);
 }
 
+// Extract model ID and FW version from an email subject line.
+// Subject format: "[Name] Release Notes - [ModelID]-[FWVersion] - Release to QA"
+// e.g. "Lory Release Notes - AVD6001-0.100.159_b075390 - Release to QA"
+function parseSubjectForModelInfo(subject) {
+  // Match ModelID (uppercase letters+digits) followed by dash then version (starts with digit)
+  const m = subject.match(/([A-Z][A-Z0-9]*\d+)-([\d][\d._b]+)/);
+  if (!m) return null;
+  return { modelId: m[1], fwVersion: m[2] };
+}
+
+function autofillFromSubject(subject) {
+  if (!subject) return;
+  const info = parseSubjectForModelInfo(subject);
+  if (!info) return;
+  const modelEl = document.getElementById('model-id');
+  const verEl   = document.getElementById('fw-version');
+  modelEl.value = info.modelId;
+  verEl.value   = info.fwVersion;
+  modelEl.style.borderColor = 'var(--accent)';
+  verEl.style.borderColor   = 'var(--accent)';
+  setTimeout(() => { modelEl.style.borderColor = ''; verEl.style.borderColor = ''; }, 2000);
+}
+
 // File input: read .eml/.msg/.txt into textarea
 document.getElementById('release-notes-file').addEventListener('change', function(e) {
   const file = e.target.files[0];
@@ -1875,8 +1898,19 @@ document.getElementById('release-notes-file').addEventListener('change', functio
     let content = ev.target.result;
     const lower = file.name.toLowerCase();
     if (lower.endsWith('.eml')) {
+      // Extract subject from headers before parsing body
+      const subjectMatch = content.match(/^Subject:[ \t]*(.+?)(?:\r?\n(?![ \t]))/im);
+      if (subjectMatch) autofillFromSubject(subjectMatch[1].replace(/\r?\n[ \t]+/g, ' ').trim());
       content = parseEmlToText(content);
     } else if (lower.endsWith('.msg')) {
+      // OLE2/Outlook .msg: subject stored as readable ASCII in binary — scan for it
+      const subjectInBinary = content.match(/([A-Za-z ]+Release Notes\s*-\s*[A-Z][A-Z0-9]*\d+-[\d][\d._b]+[^\r\n]*)/);
+      if (subjectInBinary) {
+        autofillFromSubject(subjectInBinary[1]);
+      } else {
+        // Fallback: use filename (users often keep the subject as filename)
+        autofillFromSubject(file.name.replace(/\.msg$/i, ''));
+      }
       // OLE2/Outlook .msg: HTML body is embedded as readable text — extract it
       const htmlStart = content.search(/<html[\s>]/i);
       const htmlEnd   = content.search(/<\/html>/i);
@@ -1889,6 +1923,9 @@ document.getElementById('release-notes-file').addEventListener('change', functio
       } else {
         content = content.replace(/[^\x20-\x7E\n]/g, ' ').replace(/ {2,}/g, ' ');
       }
+    } else {
+      // .txt fallback: try filename
+      autofillFromSubject(file.name.replace(/\.txt$/i, ''));
     }
     document.getElementById('email-content').value = content;
     nameEl.title = `Extracted ${content.length} characters from ${file.name}`;
