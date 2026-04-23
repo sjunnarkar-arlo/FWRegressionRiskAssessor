@@ -429,11 +429,16 @@
       <span class="logo-sub">Jira-powered · Claude AI</span>
     </div>
 
-    <input type="hidden" id="model-id" />
-    <input type="hidden" id="fw-version" />
-
     <div class="sidebar-section">
-      <div class="sidebar-label">Release info</div>
+      <div class="sidebar-label">Release info <span style="font-size:10px;color:var(--hint);font-weight:normal;text-transform:none;letter-spacing:0">— auto-filled from email</span></div>
+      <div class="field">
+        <label>Model ID</label>
+        <input type="text" id="model-id" placeholder="e.g. VMC4040P" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label>FW Version</label>
+        <input type="text" id="fw-version" placeholder="e.g. 0.100.159_b075390" autocomplete="off" spellcheck="false" />
+      </div>
       <div class="field">
         <label>SW / Client Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
         <input type="text" id="sw-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
