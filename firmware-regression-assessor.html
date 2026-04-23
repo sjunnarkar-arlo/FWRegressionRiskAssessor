@@ -429,26 +429,49 @@
     </div>
 
     <div class="sidebar-section">
-      <div class="sidebar-label">Release info <span style="font-size:10px;color:var(--hint);font-weight:normal;text-transform:none;letter-spacing:0">— auto-filled from email</span></div>
+      <div class="sidebar-label">Release type</div>
       <div class="field">
-        <label>Model ID</label>
-        <input type="text" id="model-id" placeholder="e.g. VMC4040P" autocomplete="off" spellcheck="false" />
+        <select id="release-type" onchange="onReleaseTypeChange()">
+          <option value="fw">Firmware (FW)</option>
+          <option value="sw">Software (SW)</option>
+        </select>
       </div>
-      <div class="field">
-        <label>FW Version</label>
-        <input type="text" id="fw-version" placeholder="e.g. 0.100.159_b075390" autocomplete="off" spellcheck="false" />
+
+      <!-- FW fields -->
+      <div id="fw-fields">
+        <div class="sidebar-label" style="margin-top:8px">Release info <span style="font-size:10px;color:var(--hint);font-weight:normal;text-transform:none;letter-spacing:0">— auto-filled from email</span></div>
+        <div class="field">
+          <label>Model ID</label>
+          <input type="text" id="model-id" placeholder="e.g. VMC4040P" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label>FW Version</label>
+          <input type="text" id="fw-version" placeholder="e.g. 0.100.159_b075390" autocomplete="off" spellcheck="false" />
+        </div>
       </div>
-      <div class="field">
-        <label>iOS Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
-        <input type="text" id="ios-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
-      </div>
-      <div class="field">
-        <label>Android Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
-        <input type="text" id="android-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
-      </div>
-      <div class="field">
-        <label>Web Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
-        <input type="text" id="web-version" placeholder="e.g. 1.5.2" autocomplete="off" spellcheck="false" />
+
+      <!-- SW fields -->
+      <div id="sw-fields" style="display:none">
+        <div class="sidebar-label" style="margin-top:8px">Client type</div>
+        <div class="field">
+          <select id="sw-client-type" onchange="onSwClientTypeChange()">
+            <option value="ios">iOS</option>
+            <option value="android">Android</option>
+            <option value="web">Web</option>
+          </select>
+        </div>
+        <div class="field" id="ios-version-field">
+          <label>iOS Version</label>
+          <input type="text" id="ios-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="field" id="android-version-field" style="display:none">
+          <label>Android Version</label>
+          <input type="text" id="android-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="field" id="web-version-field" style="display:none">
+          <label>Web Version</label>
+          <input type="text" id="web-version" placeholder="e.g. 1.5.2" autocomplete="off" spellcheck="false" />
+        </div>
       </div>
     </div>
 
@@ -460,9 +483,9 @@
       </label>
       <div class="field" id="source-field" style="display:none;margin-top:4px">
         <label>Commit source</label>
-        <select id="data-source">
-          <option value="github">GitHub commits</option>
+        <select id="data-source" onchange="onDataSourceChange()">
           <option value="email">Email release notes</option>
+          <option value="github">GitHub commits</option>
         </select>
       </div>
       <div id="email-paste-field" style="display:none">
@@ -1689,13 +1712,16 @@ function runDemo() {
 
 // ── MAIN RUN ─────────────────────────────────────────────
 async function runAssessment() {
-  const modelId      = document.getElementById('model-id').value.trim();
-  const fwVersion    = document.getElementById('fw-version').value.trim();
-  const iosVersion     = document.getElementById('ios-version').value.trim();
-  const androidVersion = document.getElementById('android-version').value.trim();
-  const webVersion     = document.getElementById('web-version').value.trim();
+  const releaseType    = document.getElementById('release-type').value;
+  const isFw           = releaseType === 'fw';
+  const modelId        = isFw ? document.getElementById('model-id').value.trim() : '';
+  const fwVersion      = isFw ? document.getElementById('fw-version').value.trim() : '';
+  const swClient       = !isFw ? document.getElementById('sw-client-type').value : '';
+  const iosVersion     = (!isFw && swClient === 'ios')     ? document.getElementById('ios-version').value.trim() : '';
+  const androidVersion = (!isFw && swClient === 'android') ? document.getElementById('android-version').value.trim() : '';
+  const webVersion     = (!isFw && swClient === 'web')     ? document.getElementById('web-version').value.trim() : '';
   const swVersion      = [iosVersion && `iOS ${iosVersion}`, androidVersion && `Android ${androidVersion}`, webVersion && `Web ${webVersion}`].filter(Boolean).join(', ');
-  const useMcp       = document.getElementById('use-mcp').checked;
+  const useMcp         = document.getElementById('use-mcp').checked;
   const bedrockCreds = (() => {
     const keyId  = document.getElementById('bedrock-key-id').value.trim();
     const secret = document.getElementById('bedrock-secret').value.trim();
@@ -1823,17 +1849,48 @@ async function runAssessment() {
 }
 
 
+function onSwClientTypeChange() {
+  const client = document.getElementById('sw-client-type').value;
+  document.getElementById('ios-version-field').style.display     = client === 'ios'     ? 'block' : 'none';
+  document.getElementById('android-version-field').style.display = client === 'android' ? 'block' : 'none';
+  document.getElementById('web-version-field').style.display     = client === 'web'     ? 'block' : 'none';
+}
+
+function onReleaseTypeChange() {
+  const isFw = document.getElementById('release-type').value === 'fw';
+  document.getElementById('fw-fields').style.display = isFw ? 'block' : 'none';
+  document.getElementById('sw-fields').style.display = isFw ? 'none' : 'block';
+  // SW always uses GitHub; FW defaults to email release notes
+  const dataSource = document.getElementById('data-source');
+  if (!isFw) {
+    dataSource.value = 'github';
+    document.getElementById('email-paste-field').style.display = 'none';
+  } else {
+    dataSource.value = 'email';
+    const mcpOn = document.getElementById('use-mcp').checked;
+    document.getElementById('email-paste-field').style.display = mcpOn ? 'block' : 'none';
+  }
+  // Show/hide the commit source dropdown — only relevant for FW when MCP is on
+  const mcpOn = document.getElementById('use-mcp').checked;
+  document.getElementById('source-field').style.display = (mcpOn && isFw) ? 'block' : (mcpOn && !isFw) ? 'none' : 'none';
+}
+
+function onDataSourceChange() {
+  const isEmail = document.getElementById('data-source').value === 'email';
+  document.getElementById('email-paste-field').style.display = isEmail ? 'block' : 'none';
+}
+
 document.getElementById('use-mcp').addEventListener('change', function() {
-  document.getElementById('source-field').style.display = this.checked ? 'block' : 'none';
+  const isFw = document.getElementById('release-type').value === 'fw';
+  document.getElementById('source-field').style.display = (this.checked && isFw) ? 'block' : 'none';
   if (!this.checked) {
     document.getElementById('email-paste-field').style.display = 'none';
-    document.getElementById('data-source').value = 'github';
+    document.getElementById('data-source').value = isFw ? 'email' : 'github';
+  } else {
+    // When MCP turned on: restore sensible defaults per release type
+    document.getElementById('data-source').value = isFw ? 'email' : 'github';
+    document.getElementById('email-paste-field').style.display = isFw ? 'block' : 'none';
   }
-});
-
-document.getElementById('data-source').addEventListener('change', function() {
-  const isEmail = this.value === 'email';
-  document.getElementById('email-paste-field').style.display = isEmail ? 'block' : 'none';
 });
 
 // ── EML MIME PARSER ──────────────────────────────────────────
