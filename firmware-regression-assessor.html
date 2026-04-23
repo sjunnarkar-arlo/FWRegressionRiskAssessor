@@ -1351,9 +1351,10 @@ async function sigV4Headers(method, url, bodyStr, keyId, secret, token, region) 
   return hdrs;
 }
 
-async function bedrockInvoke(url, messages, tools, bedrockCreds) {
+async function bedrockInvoke(url, messages, tools, bedrockCreds, system) {
   const { keyId, secret, token, region, bedrockModel } = bedrockCreds;
   const bodyObj = { anthropic_version: 'bedrock-2023-05-31', max_tokens: 8000, messages };
+  if (system) bodyObj.system = system;
   if (tools && tools.length) bodyObj.tools = tools;
   const body = JSON.stringify(bodyObj);
   const hdrs = await sigV4Headers('POST', url, body, keyId, secret, token || null, region);
@@ -1467,7 +1468,7 @@ ${projKey ? `Jira project key: ${projKey}` : ''}`;
 
   const messages = [{ role: 'user', content: userContent }];
 
-  let data = await bedrockInvoke(url, messages, tools.length ? tools : undefined, creds);
+  let data = await bedrockInvoke(url, messages, tools.length ? tools : undefined, creds, systemPrompt);
   log(`Bedrock turn 1: stop_reason=${data.stop_reason}`, 'info');
 
   // Agentic tool-use loop — Bedrock drives Zephyr/Confluence queries
@@ -1492,7 +1493,7 @@ ${projKey ? `Jira project key: ${projKey}` : ''}`;
     }
 
     messages.push({ role: 'user', content: toolResults });
-    data = await bedrockInvoke(url, messages, tools, creds);
+    data = await bedrockInvoke(url, messages, tools, creds, systemPrompt);
     log(`Bedrock turn ${turns + 1}: stop_reason=${data.stop_reason}`, 'info');
   }
 
