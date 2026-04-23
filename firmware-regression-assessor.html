@@ -431,6 +431,43 @@
   .exec-area-verdict { font-size: 12px; color: var(--muted); line-height: 1.4; }
   .exec-area-meta { font-family: var(--mono); font-size: 10px; color: var(--hint); margin-top: 6px; line-height: 1.5; }
 
+  /* Software Assessment — platform blocks */
+  .sw-platform {
+    margin-bottom: 1.5rem;
+    border: 1px solid var(--border2);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .sw-platform-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    background: var(--bg3);
+    border-bottom: 1px solid var(--border);
+  }
+  .sw-platform-title {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .sw-platform-name { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--text); }
+  .sw-platform-ver  { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+  .sw-platform-body { padding: 14px 16px; background: var(--bg2); }
+  .sw-platform-summary { font-size: 13px; color: var(--muted); line-height: 1.6; margin-bottom: 12px; }
+  .sw-risk-pill {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    padding: 3px 9px;
+    border-radius: 10px;
+    white-space: nowrap;
+  }
+  .sw-risk-high   { background: var(--r-high-bg); color: var(--r-high); border: 1px solid var(--r-high-border); }
+  .sw-risk-medium { background: var(--r-med-bg);  color: var(--r-med);  border: 1px solid var(--r-med-border); }
+  .sw-risk-low    { background: var(--r-low-bg);  color: var(--r-low);  border: 1px solid var(--r-low-border); }
+
   /* Scrollbar */
   ::-webkit-scrollbar { width: 5px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -450,6 +487,22 @@
 
     <input type="hidden" id="model-id" />
     <input type="hidden" id="fw-version" />
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Client Platforms <span style="font-size:10px;color:var(--hint)">(optional)</span></div>
+      <div class="field">
+        <label>Android version</label>
+        <input type="text" id="android-version" placeholder="e.g. 6.24.0" />
+      </div>
+      <div class="field">
+        <label>iOS version</label>
+        <input type="text" id="ios-version" placeholder="e.g. 6.23.0" />
+      </div>
+      <div class="field">
+        <label>Web Client version</label>
+        <input type="text" id="web-version" placeholder="e.g. 6.24.0" />
+      </div>
+    </div>
 
     <div class="sidebar-section">
       <div class="sidebar-label">Data source</div>
@@ -1547,7 +1600,7 @@ function log(msg, type = '') {
 
 // ── STEP 3: CLAUDE RISK ASSESSMENT ──────────────────────
 async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearched, refsUsed, anthropicKey, extras = {}) {
-  const { ticketFullDetails = '', confluenceContext = '', zephyrCycles = '' } = extras;
+  const { ticketFullDetails = '', confluenceContext = '', zephyrCycles = '', clientPlatforms = [] } = extras;
   const repoSummary = Object.entries(refsUsed||{}).map(([r,ref]) => `${r}@${ref}`).join(', ') || reposSearched.join(', ');
 
   const ticketList = tickets.map(t => {
@@ -1557,29 +1610,39 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
 
   const hasZephyr     = zephyrCycles.trim().length > 0;
   const hasExecutions = zephyrCycles.includes('=== EXECUTION SUMMARY ===');
+  const hasClients    = clientPlatforms.length > 0;
 
-  const prompt = `You are a senior firmware QA engineer at Arlo. Analyze the firmware release for model "${modelId}" version "${fwVersion}" (repos: ${repoSummary}).
+  const clientSection = hasClients ? clientPlatforms.map(p => {
+    const tList = p.tickets.slice(0, 40).map(t => `- ${t.key} [${t.priority}]: ${t.summary}`).join('\n');
+    return `### ${p.platform} ${p.version}\nGo/No Go content:\n${p.goNoGoSummary.slice(0, 1500)}\n\nJira Release Tickets (${p.tickets.length}):\n${tList || '(none retrieved)'}`;
+  }).join('\n\n') : '';
 
-## TICKETS & CODE CHANGES
+  const prompt = `You are a senior QA engineer at Arlo. Analyze a combined firmware + client software release.
+
+## FIRMWARE — ${modelId} ${fwVersion} (repos: ${repoSummary})
+
+### FW TICKETS & CODE CHANGES
 ${ticketFullDetails || ticketList}
 
-${confluenceContext ? `## CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 2000)}\n` : ''}
-${hasZephyr ? `## ZEPHYR TEST CYCLES & EXECUTION RESULTS\nThe following data includes test cycles, test cases, and actual execution results (pass/fail/blocked) for this FW version.\n\n${zephyrCycles.slice(0, 7000)}\n` : ''}
+${confluenceContext ? `### CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 2000)}\n` : ''}
+${hasZephyr ? `### ZEPHYR TEST CYCLES & EXECUTION RESULTS\nThe following data includes test cycles, test cases, and actual execution results (pass/fail/blocked) for this FW version.\n\n${zephyrCycles.slice(0, 7000)}\n` : ''}
+${hasClients ? `\n## CLIENT-SIDE RELEASES\nAnalyze each app platform release and identify which app areas/features need testing.\n\n${clientSection}` : ''}
 
 Your task:
-1. For each ticket, identify which functional area it affects (e.g. BLE Onboarding, OTA/FOTA, Wi-Fi, Audio, Streaming, Camera Pipeline, MCU/RTOS, Storage, Doorbell, etc.).
-2. ${hasZephyr
+1. FW: For each FW ticket, identify which firmware subsystem it affects (BLE Onboarding, OTA/FOTA, Wi-Fi, Audio, Streaming, Camera Pipeline, MCU/RTOS, Storage, etc.).
+2. FW: ${hasZephyr
   ? hasExecutions
-    ? 'Analyze the Zephyr execution results: for each functional area determine whether it is "troubled" (tests FAILED or BLOCKED, and/or open high-priority tickets) or "safe" (all tests PASSED and related tickets are resolved). Recommend which cycles to re-run or focus on, using EXACT cycle names from the data.'
-    : 'Cross-reference those functional areas against the Zephyr cycles above. Recommend which specific cycles to execute for this release, ranked by priority. Use EXACT cycle names from the Zephyr data.'
-  : 'Based on the impacted functional areas, recommend which test cycles should be executed. Use concrete cycle names matching the affected areas (e.g. "BLE Onboarding Regression", "FOTA Regression", "Streaming & 2-Way Talk", "Audio Regression", "Factory Reset", "Sleep/Wakeup Soak", etc.).'}
-3. Assess subsystem risk based on what actually changed${hasExecutions ? ' and what the execution results reveal' : ''}.
+    ? 'Analyze the Zephyr execution results: for each functional area determine whether it is "troubled" (tests FAILED or BLOCKED) or "safe" (all tests PASSED). Recommend which cycles to re-run, using EXACT cycle names from the data.'
+    : 'Cross-reference functional areas against the Zephyr cycles. Recommend which specific cycles to execute, ranked by priority. Use EXACT cycle names from the Zephyr data.'
+  : 'Based on the impacted functional areas, recommend which FW test cycles should be executed.'}
+3. FW: Assess subsystem risk based on what actually changed${hasExecutions ? ' and execution results' : ''}.
+${hasClients ? `4. SW: For each client platform, identify which app features/flows are touched by the release (e.g. Device Setup, Subscription & Purchase, Video Playback & Modes, Notifications, Account & Settings, Home Tab, etc.). Recommend app-side test cycles for each platform.` : ''}
 
 Return ONLY valid JSON (no markdown fences):
 {
   "overall_risk": "HIGH"|"MEDIUM"|"LOW",
   "risk_score": <1-100>,
-  "summary": "<2-3 sentences: overall risk, blast radius${hasExecutions ? ', and what execution results show' : ''}>",
+  "summary": "<2-3 sentences: overall FW risk, blast radius${hasExecutions ? ', execution results' : ''}>",
   "subsystems": [
     {"name":"<subsystem>","risk":"HIGH"|"MEDIUM"|"LOW","reason":"<max 12 words>","tickets":["KEY-1"]}
   ],${hasExecutions ? `
@@ -1597,21 +1660,39 @@ Return ONLY valid JSON (no markdown fences):
     ]
   },` : ''}
   "test_cycle_recommendations": [
-    {"priority":"P1"|"P2"|"P3","cycle":"<${hasZephyr ? 'EXACT cycle name from Zephyr data' : 'cycle name for the impacted area'}>","reason":"<which ticket/change drives this, max 15 words>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
+    {"priority":"P1"|"P2"|"P3","cycle":"<${hasZephyr ? 'EXACT cycle name from Zephyr data' : 'cycle name for the impacted FW area'}>","reason":"<which ticket/change drives this, max 15 words>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
   ],
-  "key_advice": "<3-4 sentences of specific QA guidance for this exact release>"
+  "key_advice": "<3-4 sentences of specific QA guidance for this exact release>"${hasClients ? `,
+  "software_assessment": {
+    "platforms": [
+      {
+        "platform": "<Android|iOS|Web Client>",
+        "version": "<version>",
+        "risk": "HIGH"|"MEDIUM"|"LOW",
+        "risk_score": <1-100>,
+        "summary": "<2-3 sentences about what changed client-side and testing focus>",
+        "areas_at_risk": [
+          {"name":"<feature area>","risk":"HIGH"|"MEDIUM"|"LOW","reason":"<max 12 words>","tickets":["KEY-1"]}
+        ],
+        "test_recommendations": [
+          {"priority":"P1"|"P2"|"P3","cycle":"<app test cycle name>","reason":"<reason, max 15 words>","tickets":["KEY-1"]}
+        ]
+      }
+    ]
+  }` : ''}
 }
 
 Rules:
-- subsystems: 4-8 items, risk DESC. Real names: Wi-Fi Stack, BLE Onboarding FSM, NIM Layer, OTA Manager, Power Manager, MCU/RTOS, LED Controller, Camera Pipeline, Audio Subsystem, Storage/UBI, Motion Detection, ERPC Layer.${hasExecutions ? `
+- subsystems: 4-8 items, risk DESC. FW subsystem names: Wi-Fi Stack, BLE Onboarding FSM, NIM Layer, OTA Manager, Power Manager, MCU/RTOS, LED Controller, Camera Pipeline, Audio Subsystem, Storage/UBI, Motion Detection, ERPC Layer.${hasExecutions ? `
 - execution_report.troubled_areas: areas with FAILED/BLOCKED tests OR open high-priority tickets. safe_areas: areas where all tests PASSED AND related tickets are resolved.` : ''}
-- test_cycle_recommendations: ${hasZephyr ? 'ONLY use cycle names that appear in the Zephyr data above. P1 = directly touched area, P2 = shared dependency, P3 = regression safety net.' : '6-12 items covering all impacted areas. Every P1 must cite at least one ticket.'} P1 first. run_type: "full" for high-risk, "smoke" for low-risk, "regression" for medium.
-- Cross-project shared-code changes push risk_score higher.`;
+- test_cycle_recommendations: ${hasZephyr ? 'ONLY use cycle names that appear in the Zephyr data above. P1 = directly touched area, P2 = shared dependency, P3 = regression safety net.' : '6-12 items covering all impacted FW areas. Every P1 must cite at least one ticket.'} P1 first. run_type: "full" for high-risk, "smoke" for low-risk, "regression" for medium.
+- Cross-project shared-code changes push risk_score higher.${hasClients ? `
+- software_assessment.platforms: one entry per platform provided. areas_at_risk: 3-6 items per platform, use real app feature names (Device Setup & Onboarding, Live View & Streaming, Video Playback, Smart Alerts & Notifications, Subscription & IAP, Account & Settings, Modes & Rules, Share & Permissions). test_recommendations: 4-8 items, P1 for directly impacted flows.` : ''}`;
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 6000, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 8000, messages: [{ role: 'user', content: prompt }] })
   });
   if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.error?.message || `Claude error ${resp.status}`); }
   const data = await resp.json();
@@ -1622,7 +1703,7 @@ Rules:
 }
 
 // ── RENDER ───────────────────────────────────────────────
-function renderResults(assessment, tickets, commitData, modelId, fwVersion, reposSearched, refsUsed, sourceType = 'github') {
+function renderResults(assessment, tickets, commitData, modelId, fwVersion, reposSearched, refsUsed, sourceType = 'github', clientPlatforms = []) {
   const rC = assessment.overall_risk === 'HIGH' ? 'high' : assessment.overall_risk === 'MEDIUM' ? 'medium' : 'low';
   const projects = [...new Set(tickets.map(t => t.project))];
   const projColors = ['#00d4aa','#7a8fff','#f0a040','#ff7eb6','#a78bfa','#34d399'];
@@ -1779,6 +1860,108 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
         </table>` : '<div style="padding:12px;color:var(--hint);font-size:12px">No test cycle recommendations generated.</div>'}
       </div>
 
+      ${(() => {
+        // Software Assessment — AI-analyzed or raw data fallback
+        const swAssess = assessment.software_assessment;
+        const platforms = swAssess?.platforms || [];
+
+        // Raw platform data (from fetched client data, even without AI analysis)
+        const rawPlatforms = clientPlatforms.filter(p => p.tickets.length > 0 || p.goNoGoSummary.length > 0);
+
+        // Merge: prefer AI-analyzed platform entry; fallback to raw if AI didn't return it
+        const allPlatforms = rawPlatforms.map(raw => {
+          const ai = platforms.find(p => p.platform === raw.platform);
+          return { raw, ai };
+        });
+
+        if (!allPlatforms.length) return '';
+
+        const riskPill = r => {
+          const c = (r||'').toLowerCase();
+          return `<span class="sw-risk-pill sw-risk-${c === 'high' ? 'high' : c === 'medium' ? 'medium' : 'low'}">${(r||'?').toUpperCase()}</span>`;
+        };
+
+        const platformBlocks = allPlatforms.map(({ raw, ai }) => {
+          const areaCards = (ai?.areas_at_risk || []).map(a => {
+            const c = a.risk === 'HIGH' ? 'high' : a.risk === 'MEDIUM' ? 'medium' : 'low';
+            return `<div class="sub-card ${c}">
+              <div class="sub-name">${a.name}</div>
+              <div class="sub-reason">${a.reason}</div>
+              ${(a.tickets||[]).length ? `<div class="sub-tickets">${a.tickets.join(', ')}</div>` : ''}
+            </div>`;
+          }).join('');
+
+          const cycleRows = (ai?.test_recommendations || []).map(r => {
+            const pc = r.priority==='P1'?'tc-p1':r.priority==='P2'?'tc-p2':'tc-p3';
+            return `<tr>
+              <td><span class="tc-pri-badge ${pc}">${r.priority||'P2'}</span></td>
+              <td><span class="cycle-name">${r.cycle||''}</span></td>
+              <td><span style="font-family:var(--mono);font-size:10px;color:var(--accent2)">${(r.tickets||[]).join(', ')}</span></td>
+              <td><span class="cycle-reason">${r.reason||''}</span></td>
+            </tr>`;
+          }).join('');
+
+          const ticketRows = raw.tickets.slice(0, 20).map(t => `
+            <div class="ticket-row">
+              <span class="ticket-key">${t.key}</span>
+              <span class="ticket-summary">${t.summary}</span>
+              ${t.priority === 'P0' ? `<span class="ticket-pri pri-p0">P0</span>` :
+                t.priority === 'P1' ? `<span class="ticket-pri pri-p1">P1</span>` :
+                t.priority === 'P3' ? `<span class="ticket-pri pri-p3">P3</span>` :
+                `<span class="ticket-pri pri-p2">P2</span>`}
+            </div>`).join('');
+
+          const totalTickets = raw.tickets.length;
+          const overflow = totalTickets > 20 ? `<div style="padding:6px 0;font-family:var(--mono);font-size:10px;color:var(--hint)">… and ${totalTickets - 20} more tickets</div>` : '';
+
+          return `
+          <div class="sw-platform">
+            <div class="sw-platform-header">
+              <div class="sw-platform-title">
+                <span class="sw-platform-name">${raw.platform}</span>
+                <span class="sw-platform-ver">${raw.version}</span>
+                ${ai ? `<span style="font-family:var(--mono);font-size:10px;color:var(--hint)">${totalTickets} tickets</span>` : ''}
+              </div>
+              ${ai ? riskPill(ai.risk) : `<span style="font-family:var(--mono);font-size:10px;color:var(--hint)">no AI analysis</span>`}
+            </div>
+            <div class="sw-platform-body">
+              ${ai?.summary ? `<div class="sw-platform-summary">${ai.summary}</div>` : ''}
+
+              ${areaCards ? `
+              <div style="margin-bottom:12px">
+                <div class="section-header" style="margin-bottom:8px"><span class="section-title">Areas at risk</span><span class="section-count">${(ai?.areas_at_risk||[]).length}</span></div>
+                <div class="sub-grid">${areaCards}</div>
+              </div>` : ''}
+
+              ${cycleRows ? `
+              <div style="margin-bottom:12px">
+                <div class="section-header" style="margin-bottom:8px"><span class="section-title">Test cycles</span><span class="section-count">${(ai?.test_recommendations||[]).length}</span></div>
+                <table class="cycle-table">
+                  <thead><tr><th>Pri</th><th>Cycle</th><th>Tickets</th><th>Reason</th></tr></thead>
+                  <tbody>${cycleRows}</tbody>
+                </table>
+              </div>` : ''}
+
+              ${ticketRows ? `
+              <div>
+                <div class="section-header" style="margin-bottom:8px"><span class="section-title">Release tickets</span><span class="section-count">${totalTickets}</span></div>
+                <div class="ticket-list">${ticketRows}</div>
+                ${overflow}
+              </div>` : (raw.goNoGoSummary ? `<div style="font-family:var(--mono);font-size:11px;color:var(--muted);line-height:1.6;max-height:200px;overflow-y:auto">${raw.goNoGoSummary.slice(0, 1200)}</div>` : '')}
+            </div>
+          </div>`;
+        }).join('');
+
+        return `
+        <div class="section">
+          <div class="section-header">
+            <span class="section-title">Software Assessment</span>
+            <span class="section-count">${allPlatforms.length} platform${allPlatforms.length !== 1 ? 's' : ''}</span>
+          </div>
+          ${platformBlocks}
+        </div>`;
+      })()}
+
     </div>`;
 }
 
@@ -1836,6 +2019,82 @@ function runDemo() {
   );
 }
 
+// ── CLIENT PLATFORM DATA ─────────────────────────────────
+const CLIENT_PLATFORM_CONFIG = {
+  'Android':    { jiraProject: 'ANDAPP', label: 'Android' },
+  'iOS':        { jiraProject: 'IOSAPP', label: 'iOS'     },
+  'Web Client': { jiraProject: null,     label: 'Web Client' },
+};
+
+async function fetchClientPlatformDataViaMcp(platform, version, client) {
+  const config = CLIENT_PLATFORM_CONFIG[platform] || { jiraProject: null, label: platform };
+  const tools = await client.listTools();
+  const conflSearch = tools.find(t => t.name === 'confluence_search')?.name;
+  const conflRead   = tools.find(t => t.name === 'confluence_read_page')?.name;
+  const jiraSearch  = tools.find(t => t.name === 'jira_search')?.name || 'jira_search';
+
+  let goNoGoSummary = '';
+  let tickets = [];
+
+  // 1. Confluence: find the Go/No Go page for this platform + version
+  if (conflSearch) {
+    try {
+      log(`Confluence: Go/No Go "${version} - ${config.label}"…`, 'tool');
+      const raw = await client.callTool(conflSearch, {
+        cql: `title ~ "Go/No Go" AND title ~ "${version}" AND title ~ "${config.label}"`,
+        max_results: 3
+      });
+      if (conflRead) {
+        const pageIds = [...raw.matchAll(/(\d{7,})/g)].map(m => m[1]).filter((v,i,a)=>a.indexOf(v)===i).slice(0, 1);
+        for (const pid of pageIds) {
+          log(`Reading Go/No Go page ${pid} (${platform})`, 'tool');
+          const page = await client.callTool(conflRead, { page_id: pid, max_chars: 4000 });
+          goNoGoSummary = page;
+        }
+      }
+      if (!goNoGoSummary) goNoGoSummary = raw.slice(0, 2500);
+    } catch(e) {
+      log(`Confluence search failed (${platform}): ${e.message}`, 'info');
+    }
+  }
+
+  // 2. Jira: fetch all fixVersion tickets for this release
+  if (config.jiraProject) {
+    try {
+      log(`Jira: ${config.jiraProject} fixVersion "${version}"…`, 'tool');
+      const raw = await client.callTool(jiraSearch, {
+        jql: `project = ${config.jiraProject} AND fixVersion = "${version}" ORDER BY priority ASC`,
+        fields: 'summary,priority,status,assignee',
+        limit: 60
+      });
+      tickets = normalizeJiraResults(raw, []);
+      log(`${platform} tickets: ${tickets.length}`, 'success');
+    } catch(e) {
+      log(`Jira search failed (${platform} ${version}): ${e.message}`, 'info');
+    }
+  } else if (goNoGoSummary) {
+    // Web Client: extract any ticket keys from the Go/No Go page and look them up
+    const keyPattern = /\b([A-Z][A-Z0-9]+-\d+)\b/g;
+    const keys = [...new Set([...goNoGoSummary.matchAll(keyPattern)].map(m => m[1]))].slice(0, 30);
+    if (keys.length) {
+      try {
+        log(`Jira: fetching ${keys.length} tickets from Web Client Go/No Go…`, 'tool');
+        const raw = await client.callTool(jiraSearch, {
+          jql: `issueKey in (${keys.map(k=>`"${k}"`).join(',')}) ORDER BY priority ASC`,
+          fields: 'summary,priority,status,assignee',
+          limit: keys.length + 5
+        });
+        tickets = normalizeJiraResults(raw, []);
+        log(`Web Client tickets: ${tickets.length}`, 'success');
+      } catch(e) {
+        log(`Web Client Jira lookup failed: ${e.message}`, 'info');
+      }
+    }
+  }
+
+  return { platform, version, tickets, goNoGoSummary };
+}
+
 // ── MAIN RUN ─────────────────────────────────────────────
 async function runAssessment() {
   const modelId      = document.getElementById('model-id').value.trim();
@@ -1879,9 +2138,17 @@ async function runAssessment() {
       'Connecting to Arlochat MCP',
       step1Label,
       'Jira: full ticket details',
-      'Confluence + Zephyr: docs + template test cycles',
-      anthropicKey ? 'Claude AI risk analysis' : 'Rule-based risk analysis'
+      'Confluence + Zephyr + Client platforms',
+      anthropicKey ? 'Claude AI risk analysis (FW + SW)' : 'Rule-based risk analysis'
     ]);
+
+    // Collect client platform versions from sidebar inputs
+    const clientPlatformInputs = [
+      { platform: 'Android',    version: (document.getElementById('android-version')?.value || '').trim() },
+      { platform: 'iOS',        version: (document.getElementById('ios-version')?.value    || '').trim() },
+      { platform: 'Web Client', version: (document.getElementById('web-version')?.value    || '').trim() },
+    ].filter(p => p.version);
+
     const client = new McpClient(
       `${window.location.origin}/mcp/sse`,
       null,
@@ -1909,18 +2176,26 @@ async function runAssessment() {
         ? zephyrKeyInput.split(/[,;\s]+/).map(k => k.trim().toUpperCase()).filter(Boolean)
         : [...new Set(ticketKeys.map(k => k.replace(/-\d+$/, '')))];
       log(`Zephyr project key(s): ${zephyrKeys.join(', ')}`, 'info');
-      const [confluenceContext, zephyrCycles] = await Promise.all([
+      if (clientPlatformInputs.length) log(`Client platforms: ${clientPlatformInputs.map(p => `${p.platform} ${p.version}`).join(', ')}`, 'info');
+
+      const [confluenceContext, zephyrCycles, ...clientResults] = await Promise.all([
         fetchConfluenceContextViaMcp(modelId, client).catch(e => { log(`Confluence failed: ${e.message}`, 'info'); return ''; }),
-        fetchZephyrTestCyclesViaMcp(zephyrKeys, modelId, fwVersion, client).catch(e => { log(`Zephyr failed: ${e.message}`, 'info'); return ''; })
+        fetchZephyrTestCyclesViaMcp(zephyrKeys, modelId, fwVersion, client).catch(e => { log(`Zephyr failed: ${e.message}`, 'info'); return ''; }),
+        ...clientPlatformInputs.map(p =>
+          fetchClientPlatformDataViaMcp(p.platform, p.version, client)
+            .catch(e => { log(`Client platform fetch failed (${p.platform}): ${e.message}`, 'info'); return { platform: p.platform, version: p.version, tickets: [], goNoGoSummary: '' }; })
+        )
       ]);
-      log(`Confluence: ${confluenceContext.length} chars | Zephyr: ${zephyrCycles.length} chars`, 'info');
+
+      const clientPlatforms = clientResults;
+      log(`Confluence: ${confluenceContext.length} chars | Zephyr: ${zephyrCycles.length} chars | Client platforms: ${clientPlatforms.length}`, 'info');
 
       activateStep(4);
       const assessment = anthropicKey
-        ? await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, anthropicKey, { ticketFullDetails: fullDetails, confluenceContext, zephyrCycles })
+        ? await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, anthropicKey, { ticketFullDetails: fullDetails, confluenceContext, zephyrCycles, clientPlatforms })
         : ruleBasedAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used);
 
-      setTimeout(() => renderResults(assessment, tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, dataSource), 300);
+      setTimeout(() => renderResults(assessment, tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, dataSource, clientPlatforms), 300);
     } catch(e) {
       client.close();
       showError(e.message);
