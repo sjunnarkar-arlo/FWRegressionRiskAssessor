@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>FW Regression Risk Assessor</title>
-<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2/lib/msal-browser.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
 
@@ -445,13 +444,6 @@
           <option value="email">Email release notes</option>
         </select>
       </div>
-      <div class="field" id="ms-auth-field" style="display:none">
-        <label>Azure App Client ID</label>
-        <input type="text" id="ms-client-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" style="font-size:11px" />
-        <label style="margin-top:6px">Tenant ID or domain <span style="font-size:10px;color:var(--hint)">(e.g. arlo.com)</span></label>
-        <input type="text" id="ms-tenant-id" placeholder="xxxxxxxx-… or arlo.com" style="font-size:11px;margin-top:4px" />
-        <span id="ms-signin-status" style="font-family:var(--mono);font-size:10px;color:var(--hint);margin-top:4px;display:block"></span>
-      </div>
       <div id="email-paste-field" style="display:none">
         <div class="field">
           <label>Attach file <span style="font-size:10px;color:var(--hint)">(.eml .msg .txt)</span></label>
@@ -476,10 +468,6 @@
           <label>Secret Access Key</label>
           <input type="password" id="bedrock-secret" placeholder="••••••••" autocomplete="new-password" spellcheck="false" />
         </div>
-        <div class="field">
-          <label>Session Token <span style="font-size:10px;color:var(--hint)">(STS — recommended)</span></label>
-          <input type="password" id="bedrock-token" placeholder="optional — paste STS token" autocomplete="new-password" spellcheck="false" />
-        </div>
         <div style="display:flex;gap:6px">
           <div class="field" style="flex:1">
             <label>Region</label>
@@ -494,7 +482,7 @@
       <div class="api-note">
         <b style="color:var(--accent)">MCP on</b> → requires <code style="font-size:10px;color:var(--muted)">node proxy.js</code> + VPN. Add Bedrock credentials for AI analysis, or leave blank for rule-based scoring.<br><br>
         <b style="color:var(--hint)">MCP off</b> → demo mode (no data fetching).<br><br>
-        <b style="color:var(--accent)">Security tip:</b> Use short-lived STS credentials (<code style="font-size:10px;color:var(--muted)">aws sts get-session-token</code>) scoped to <code style="font-size:10px;color:var(--muted)">bedrock:InvokeModel</code> only. Never use root or broad IAM keys.
+        <b style="color:var(--accent)">Security tip:</b> Use an IAM key scoped to <code style="font-size:10px;color:var(--muted)">bedrock:InvokeModel</code> only. Never use root or broad IAM keys.
       </div>
     </div>
 
@@ -927,120 +915,16 @@ async function fetchReleaseNotesViaMcp(modelId, fwVersion, client) {
   return extractEmailItems(emailBody);
 }
 
-// ── MICROSOFT GRAPH / MSAL ───────────────────────────────
-let _msalInstance = null;
-let _msAccessToken = null;
-
-async function resolveTenantId(input) {
-  if (!input) return 'common';
-  const s = input.trim().replace(/^@/, '');
-  // Already a GUID — use directly
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return s;
-  // Domain — discover tenant GUID via OIDC metadata endpoint
-  log(`Discovering tenant for "${s}"…`, 'info');
-  const resp = await fetch(`https://login.microsoftonline.com/${s}/v2.0/.well-known/openid-configuration`);
-  if (!resp.ok) throw new Error(`Could not discover tenant for domain "${s}" (${resp.status})`);
-  const data = await resp.json();
-  const m = data.issuer?.match(/\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\//i);
-  if (!m) throw new Error(`Could not parse tenant ID from discovery response for "${s}"`);
-  log(`Tenant ID: ${m[1]}`, 'success');
-  return m[1];
-}
-
-async function acquireMsToken(clientId) {
-  if (typeof msal === 'undefined') throw new Error('MSAL library failed to load — reload the page and try again.');
-  if (_msAccessToken) return _msAccessToken;
-
-  const tenantInput = (document.getElementById('ms-tenant-id')?.value || '').trim();
-  const tenantId = await resolveTenantId(tenantInput);
-
-  if (!_msalInstance) {
-    _msalInstance = new msal.PublicClientApplication({
-      auth: {
-        clientId,
-        authority: `https://login.microsoftonline.com/${tenantId}`,
-        redirectUri: window.location.origin + window.location.pathname
-      },
-      cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: false }
-    });
-  }
-
-  const scopes = ['https://graph.microsoft.com/Mail.Read'];
-  const accounts = _msalInstance.getAllAccounts();
-  try {
-    const result = accounts.length
-      ? await _msalInstance.acquireTokenSilent({ scopes, account: accounts[0] })
-      : await _msalInstance.loginPopup({ scopes });
-    _msAccessToken = result.accessToken;
-    const name = result.account?.username || result.account?.name || '';
-    document.getElementById('ms-signin-status').textContent = `✓ signed in${name ? ` as ${name}` : ''}`;
-    return _msAccessToken;
-  } catch {
-    const result = await _msalInstance.acquireTokenPopup({ scopes });
-    _msAccessToken = result.accessToken;
-    const name = result.account?.username || result.account?.name || '';
-    document.getElementById('ms-signin-status').textContent = `✓ signed in${name ? ` as ${name}` : ''}`;
-    return _msAccessToken;
-  }
-}
-
-async function searchEmailViaGraph(token, modelId, fwVersion) {
-  // KQL: match subject containing version string (Graph uses KQL for $search)
-  const kql = `subject:"Release Notes" "${fwVersion}"`;
-  const url = `https://graph.microsoft.com/v1.0/me/messages` +
-    `?$search=${encodeURIComponent('"' + kql + '"')}` +
-    `&$select=id,subject,body,bodyPreview&$top=10`;
-
-  const resp = await fetch(url, {
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Prefer': 'outlook.body-content-type="text"'
-    }
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    throw new Error(`Graph API ${resp.status}: ${err.error?.message || 'email search failed'}`);
-  }
-  const data = await resp.json();
-  const emails = data.value || [];
-  log(`Graph returned ${emails.length} email(s)`, 'info');
-
-  if (!emails.length) {
-    throw new Error(`No email found for "${modelId}-${fwVersion}" in your inbox. Paste the email body in the sidebar to continue.`);
-  }
-
-  const modelLower = modelId.toLowerCase(), verLower = fwVersion.toLowerCase();
-  const match =
-    emails.find(e => { const s = (e.subject||'').toLowerCase(); return s.includes('release notes') && s.includes(modelLower) && s.includes(verLower); }) ||
-    emails.find(e => { const s = (e.subject||'').toLowerCase(); return s.includes('release notes') && (s.includes(modelLower) || s.includes(verLower)); }) ||
-    emails[0];
-
-  log(`Matched: "${match.subject}"`, 'success');
-  return match.body?.content || match.bodyPreview || '';
-}
-
 // ── EMAIL RELEASE NOTES: MAIN ENTRY ─────────────────────
-// Priority: pasted content > Microsoft Graph > Arlochat MCP email tool
 async function fetchEmailReleaseNotes(modelId, fwVersion, client) {
-  // 1. Pasted content
+  // 1. Pasted content or attached file
   const pasted = (document.getElementById('email-content')?.value || '').trim();
   if (pasted) {
     log(`Using pasted release notes: ${pasted.length} chars`, 'success');
     return extractEmailItems(pasted);
   }
 
-  // 2. Microsoft Graph API
-  const clientId = (document.getElementById('ms-client-id')?.value || '').trim();
-  if (clientId) {
-    log('Acquiring Microsoft token…', 'info');
-    const token = await acquireMsToken(clientId);
-    log('Searching inbox via Microsoft Graph…', 'tool');
-    const body = await searchEmailViaGraph(token, modelId, fwVersion);
-    log(`Email body: ${body.length} chars`, 'success');
-    return extractEmailItems(body);
-  }
-
-  // 3. Arlochat MCP email tool fallback
+  // 2. Arlochat MCP email tool fallback
   return fetchReleaseNotesViaMcp(modelId, fwVersion, client);
 }
 
@@ -1719,7 +1603,6 @@ async function runAssessment() {
     return {
       keyId,
       secret,
-      token:        document.getElementById('bedrock-token').value.trim() || null,
       region:       document.getElementById('bedrock-region').value.trim() || 'us-east-1',
       bedrockModel: document.getElementById('bedrock-model').value.trim() || 'global.anthropic.claude-opus-4-6-v1',
     };
@@ -1743,12 +1626,9 @@ async function runAssessment() {
   // ── DIRECT MCP MODE ───────────────────────────────────
   if (useMcp) {
     const dataSource = document.getElementById('data-source').value;
-    const msClientId = (document.getElementById('ms-client-id')?.value || '').trim();
     const step1Label = dataSource !== 'email'
       ? `GitHub: repos + commits for ${modelId}`
-      : msClientId
-        ? `Outlook: searching inbox for ${modelId} ${fwVersion}`
-        : `Email: release notes for ${modelId} ${fwVersion}`;
+      : `Email: release notes for ${modelId} ${fwVersion}`;
 
     setLoading([
       'Connecting to Arlochat MCP',
@@ -1812,14 +1692,12 @@ document.getElementById('use-mcp').addEventListener('change', function() {
   document.getElementById('source-field').style.display = this.checked ? 'block' : 'none';
   if (!this.checked) {
     document.getElementById('email-paste-field').style.display = 'none';
-    document.getElementById('ms-auth-field').style.display = 'none';
     document.getElementById('data-source').value = 'github';
   }
 });
 
 document.getElementById('data-source').addEventListener('change', function() {
   const isEmail = this.value === 'email';
-  document.getElementById('ms-auth-field').style.display = isEmail ? 'block' : 'none';
   document.getElementById('email-paste-field').style.display = isEmail ? 'block' : 'none';
 });
 
