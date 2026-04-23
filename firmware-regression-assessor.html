@@ -652,40 +652,6 @@ function showError(msg) {
   document.getElementById('btn-text').textContent = 'RUN ASSESSMENT';
 }
 
-// ── MCP CALL HELPER ──────────────────────────────────────
-async function mcpCall(anthropicKey, userPrompt, maxTokens = 8000) {
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': anthropicKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'mcp-client-2025-04-04',
-      'anthropic-dangerous-direct-browser-access': 'true'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: maxTokens,
-      tools: [{
-        type: 'mcp',
-        name: 'arlochat',
-        url: 'https://internal-arlochat-mcp-alb-880426873.us-east-1.elb.amazonaws.com:8080/sse'
-      }],
-      messages: [{ role: 'user', content: userPrompt }]
-    })
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    throw new Error(err.error?.message || `API error ${resp.status}`);
-  }
-  const data = await resp.json();
-  return data.content || [];
-}
-
-function extractText(blocks) {
-  return blocks.filter(b => b.type === 'text').map(b => b.text).join('\n');
-}
-
 function parseJsonFromText(text) {
   const clean = text.replace(/```json|```/g, '').trim();
   // Try full parse first
@@ -696,63 +662,6 @@ function parseJsonFromText(text) {
   const arrMatch = clean.match(/\[[\s\S]*\]/);
   if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch(e) {}
   return null;
-}
-
-// ── STEP 1: AGENTIC REPO + COMMIT DISCOVERY ─────────────
-// Single agentic MCP call. Claude figures out:
-//   - which repos in arlo-engineering are relevant for this model
-//   - which branch/tag corresponds to this FW version
-//   - fetches the commits for that range
-// Returns parsed commit data with ticket keys extracted.
-async function discoverCommits(modelId, fwVersion, anthropicKey) {
-  const prompt = `You are a firmware release engineer at Arlo. Use the github_cli tool to find all commits related to a firmware release for model "${modelId}", version "${fwVersion}" in the arlo-engineering GitHub org.
-
-Follow these steps using the github_cli tool:
-
-1. First, identify the relevant firmware repositories for "${modelId}". Known repos include: camif-mcu-harpy, camif-isp2mcu, nim, sv_rk1103b, fwbabycam, camif-isp-harpy. Use your knowledge of which repos are relevant for this model name (e.g. "Harpy" → camif-mcu-harpy + camif-isp2mcu, "Lory"/"PEGA" → camif-mcu-harpy + camif-isp2mcu + nim, generic model IDs → search all likely candidates).
-
-2. For each relevant repo, find the branch or tag that corresponds to version "${fwVersion}". Try:
-   - gh api repos/arlo-engineering/{repo}/branches --jq '[.[].name]' to list branches
-   - Look for branches matching the version string, release branches like "release/...", or master/main if nothing version-specific exists
-   - gh api repos/arlo-engineering/{repo}/tags --jq '[.[].name]' to check for version tags
-
-3. For each identified repo+ref, fetch recent commits:
-   - If you found a version-specific branch or tag, compare it against the previous release branch/tag:
-     gh api repos/arlo-engineering/{repo}/compare/{prev}...{current} --jq '[.commits[] | {sha: .sha[0:8], msg: .commit.message, repo: "{repo}"}]'
-   - If only master/main exists, fetch the last 60 commits:
-     gh api "repos/arlo-engineering/{repo}/commits?sha=master&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "{repo}"}]'
-
-4. Collect ALL commits from ALL relevant repos into one list.
-
-Return ONLY a JSON object in this exact format, no explanation:
-{
-  "repos_searched": ["repo1", "repo2"],
-  "refs_used": {"repo1": "branch-or-tag", "repo2": "branch-or-tag"},
-  "commits": [
-    {"sha": "abcd1234", "msg": "PEGA-123: fix something", "repo": "camif-mcu-harpy"},
-    ...
-  ]
-}`;
-
-  const blocks = await mcpCall(anthropicKey, prompt, 12000);
-  const text = extractText(blocks);
-  const parsed = parseJsonFromText(text);
-
-  if (!parsed || !Array.isArray(parsed.commits)) {
-    // Try pulling from mcp_tool_result blocks directly as fallback
-    let allCommits = [];
-    for (const b of blocks) {
-      if (b.type === 'mcp_tool_result') {
-        const t = b.content?.[0]?.text || '';
-        const arr = parseJsonFromText(t);
-        if (Array.isArray(arr)) allCommits = allCommits.concat(arr);
-      }
-    }
-    if (!allCommits.length) throw new Error(`Could not find commits for ${modelId} ${fwVersion}. Try the demo mode (leave key blank) to see expected output.`);
-    return { repos_searched: [], refs_used: {}, commits: allCommits };
-  }
-
-  return parsed;
 }
 
 // ── EXTRACT TICKET KEYS FROM COMMITS ────────────────────
@@ -780,54 +689,6 @@ function extractTicketKeys(commits) {
   }
 
   return { commitData, ticketKeys: [...seen] };
-}
-
-// ── STEP 2: FETCH JIRA DETAILS ───────────────────────────
-async function fetchJiraDetails(ticketKeys, anthropicKey) {
-  if (!ticketKeys.length) return [];
-  const keyList = ticketKeys.map(k => `"${k}"`).join(', ');
-  const jql = `issueKey in (${keyList}) ORDER BY priority ASC`;
-
-  const prompt = `Use the jira_search tool with this JQL: ${jql}
-Use fields: summary,priority,status,assignee. Set limit to ${ticketKeys.length + 5}.
-Return ONLY a JSON array. Each item: {"key":"...","summary":"...","priority":"...","status":"...","assignee":"..."}
-No explanation, no markdown fences.`;
-
-  const blocks = await mcpCall(anthropicKey, prompt, 6000);
-  const raw = extractText(blocks);
-  const extractProject = k => k ? k.replace(/-\d+$/, '') : '?';
-  const normPri = raw => {
-    const s = (raw || '').toString().toUpperCase();
-    if (s === 'P0' || s.includes('BLOCKER')) return 'P0';
-    if (s === 'P1' || s.includes('CRITICAL')) return 'P1';
-    if (s === 'P3' || s.includes('MINOR')) return 'P3';
-    return 'P2';
-  };
-
-  const arr = parseJsonFromText(raw);
-  if (Array.isArray(arr) && arr.length) {
-    return arr.map(t => ({
-      key: t.key || '', project: extractProject(t.key),
-      summary: t.summary || '(no summary)',
-      priority: normPri(t.priority), status: t.status || '', assignee: t.assignee || ''
-    })).filter(t => t.key);
-  }
-
-  // Fallback: markdown table
-  const lines = raw.split('\n').filter(l => l.startsWith('|') && !l.includes('---'));
-  if (lines.length > 1) {
-    const headers = lines[0].split('|').map(h => h.trim().toLowerCase()).filter(Boolean);
-    return lines.slice(1).map(row => {
-      const cells = row.split('|').map(c => c.trim()).filter(Boolean);
-      const obj = {};
-      headers.forEach((h, i) => { obj[h] = cells[i] || ''; });
-      const key = obj['key'] || '';
-      return { key, project: extractProject(key), summary: obj['summary'] || '', priority: normPri(obj['priority']), status: obj['status'] || '', assignee: obj['assignee'] || '' };
-    }).filter(t => t.key);
-  }
-
-  // Last resort: stubs so the assessment can still run
-  return ticketKeys.map(k => ({ key: k, project: extractProject(k), summary: '(Jira fetch failed)', priority: 'P2', status: '', assignee: '' }));
 }
 
 // ── JIRA NORMALIZER (shared) ─────────────────────────────
@@ -1490,33 +1351,91 @@ async function sigV4Headers(method, url, bodyStr, keyId, secret, token, region) 
   return hdrs;
 }
 
+async function bedrockInvoke(url, messages, tools, bedrockCreds) {
+  const { keyId, secret, token, region, bedrockModel } = bedrockCreds;
+  const bodyObj = { anthropic_version: 'bedrock-2023-05-31', max_tokens: 8000, messages };
+  if (tools && tools.length) bodyObj.tools = tools;
+  const body = JSON.stringify(bodyObj);
+  const hdrs = await sigV4Headers('POST', url, body, keyId, secret, token || null, region);
+  const resp = await fetch(url, { method: 'POST', headers: hdrs, body });
+  if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.message || e['message'] || `Bedrock error ${resp.status}`); }
+  return resp.json();
+}
+
 async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearched, refsUsed, bedrockCreds, extras = {}) {
-  const { ticketFullDetails = '', confluenceContext = '', zephyrCycles = '' } = extras;
+  const { ticketFullDetails = '', projKey = '' } = extras;
   const repoSummary = Object.entries(refsUsed||{}).map(([r,ref]) => `${r}@${ref}`).join(', ') || reposSearched.join(', ');
+  const client = extras.mcpClient || null;
 
   const ticketList = tickets.map(t => {
     const msgs = commitData.filter(c => c.keys.includes(t.key)).slice(0,2).map(c => c.msg.slice(0,120)).join(' | ');
     return `- ${t.key} [${t.priority}]: ${t.summary}${msgs ? `\n  commits: ${msgs}` : ''}`;
   }).join('\n');
 
-  const hasZephyr = zephyrCycles.trim().length > 0;
+  const { keyId, secret, token, region, bedrockModel } = bedrockCreds;
+  bedrockCreds = null;
+  const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(bedrockModel)}/invoke`;
+  const creds = { keyId, secret, token, region, bedrockModel };
 
-  const prompt = `You are a senior firmware QA engineer at Arlo. Analyze the firmware release for model "${modelId}" version "${fwVersion}" (repos: ${repoSummary}).
+  const tools = client ? [
+    {
+      name: 'zephyr_list',
+      description: 'List Zephyr folders, test cycles, or test cases. Use type="folders" to find the template folder, type="cycles" with folder_id to list cycles in that folder, type="test_cases" with cycle_id to list test cases in a cycle.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          type:        { type: 'string', enum: ['folders','cycles','test_cases'] },
+          project_key: { type: 'string' },
+          folder_id:   { type: 'string' },
+          cycle_id:    { type: 'string' },
+          max_results: { type: 'number' }
+        },
+        required: ['type', 'project_key']
+      }
+    },
+    {
+      name: 'zephyr_get_executions',
+      description: 'Get test executions (test cases and their steps) for a specific Zephyr test cycle.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          cycle_id:    { type: 'string' },
+          project_key: { type: 'string' },
+          max_results: { type: 'number' }
+        },
+        required: ['cycle_id', 'project_key']
+      }
+    },
+    {
+      name: 'confluence_search',
+      description: 'Search Confluence pages for model documentation or firmware notes.',
+      input_schema: {
+        type: 'object',
+        properties: { cql: { type: 'string' } },
+        required: ['cql']
+      }
+    },
+    {
+      name: 'confluence_read_page',
+      description: 'Read the full content of a Confluence page by its ID.',
+      input_schema: {
+        type: 'object',
+        properties: { page_id: { type: 'string' } },
+        required: ['page_id']
+      }
+    }
+  ] : [];
 
-## TICKETS & CODE CHANGES
-${ticketFullDetails || ticketList}
+  const systemPrompt = `You are a senior firmware QA engineer at Arlo. Your job is to analyze a firmware release and produce a structured risk assessment with accurate test cycle recommendations.
 
-${confluenceContext ? `## CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 2000)}\n` : ''}
-${hasZephyr ? `## ZEPHYR TEMPLATE FOLDER — TEST CYCLES & TEST CASES\nThe following data comes from the Zephyr template folder for this device's project. It includes cycle names and the test cases inside each cycle.\n\n${zephyrCycles.slice(0, 6000)}\n` : ''}
+${client ? `You have access to Zephyr and Confluence tools. Use them as follows:
+1. Call zephyr_list(type="folders", project_key="${projKey}") to find the template folder for this device project.
+2. Call zephyr_list(type="cycles", project_key="${projKey}", folder_id=<template_folder_id>) to list all cycles in that folder.
+3. For each cycle that looks relevant to the changes, call zephyr_get_executions or zephyr_list(type="test_cases") to read its actual test cases so you understand what it covers.
+4. Optionally call confluence_search to find model-specific documentation if you need more context about the device architecture.
+Only recommend cycles you have actually read — use their exact names from Zephyr. Do not invent or paraphrase cycle names.` : ''}
 
-Your task:
-1. For each ticket, identify which functional area it affects (e.g. BLE Onboarding, OTA/FOTA, Wi-Fi, Audio, Streaming, Camera Pipeline, MCU/RTOS, Storage, Doorbell, etc.).
-2. ${hasZephyr
-  ? 'Cross-reference those functional areas against the Zephyr template cycles above. Read the test cases listed under each cycle to understand what it actually covers. Then recommend which cycles from the template folder should be executed for this release, ranked by priority. Use the EXACT cycle names from the Zephyr data — do not invent cycle names.'
-  : 'Based on the impacted functional areas, recommend which test cycles should be executed. Use concrete cycle names matching the affected areas (e.g. "BLE Onboarding Regression", "FOTA Regression", "Streaming & 2-Way Talk", "Audio Regression", "Factory Reset", "Sleep/Wakeup Soak", etc.).'}
-3. Assess subsystem risk based on what actually changed.
-
-Return ONLY valid JSON (no markdown fences):
+After gathering context, return ONLY valid JSON (no markdown fences):
 {
   "overall_risk": "HIGH"|"MEDIUM"|"LOW",
   "risk_score": <1-100>,
@@ -1525,28 +1444,59 @@ Return ONLY valid JSON (no markdown fences):
     {"name":"<subsystem>","risk":"HIGH"|"MEDIUM"|"LOW","reason":"<max 12 words>","tickets":["KEY-1"]}
   ],
   "test_cycle_recommendations": [
-    {"priority":"P1"|"P2"|"P3","cycle":"<${hasZephyr ? 'EXACT cycle name from Zephyr template folder' : 'cycle name for the impacted area'}>","reason":"<which ticket/change drives this, max 15 words>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
+    {"priority":"P1"|"P2"|"P3","cycle":"<exact cycle name from Zephyr>","reason":"<why this cycle is included — which ticket/change drives it, max 15 words>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
+  ],
+  "coverage_gaps": [
+    {"area":"<functional area not covered by any existing cycle>","reason":"<which ticket/change has no cycle, max 12 words>","tickets":["KEY-1"]}
   ],
   "key_advice": "<3-4 sentences of specific QA guidance for this exact release>"
 }
 
 Rules:
-- subsystems: 4-8 items, risk DESC. Real names: Wi-Fi Stack, BLE Onboarding FSM, NIM Layer, OTA Manager, Power Manager, MCU/RTOS, LED Controller, Camera Pipeline, Audio Subsystem, Storage/UBI, Motion Detection, ERPC Layer.
-- test_cycle_recommendations: ${hasZephyr
-  ? 'ONLY recommend cycles that exist in the Zephyr template folder data above — use their exact names. Exclude cycles whose test cases have no overlap with the changes. P1 = directly touched area, P2 = shared dependency risk, P3 = broad regression safety net.'
-  : '6-12 items covering all impacted functional areas. Every P1 cycle must cite at least one ticket.'} P1 first. run_type: "full" for high-risk areas, "smoke" for low-risk, "regression" for medium.
+- subsystems: 4-8 items, risk DESC.
+- test_cycle_recommendations: ONLY cycles you retrieved from Zephyr. P1 = directly touched area, P2 = shared dependency risk, P3 = broad regression safety net. P1 first. run_type: "full" for high-risk, "smoke" for low-risk, "regression" for medium.
+- coverage_gaps: list functional areas touched by tickets that have NO matching Zephyr cycle. Empty array if everything is covered.
 - Cross-project shared-code changes push risk_score higher.`;
 
-  const { keyId, secret, token, region, bedrockModel } = bedrockCreds;
-  const url  = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(bedrockModel)}/invoke`;
-  const body = JSON.stringify({ anthropic_version: 'bedrock-2023-05-31', max_tokens: 4000, messages: [{ role: 'user', content: prompt }] });
-  let hdrs;
-  try { hdrs = await sigV4Headers('POST', url, body, keyId, secret, token || null, region); }
-  finally { /* credential strings stay in JS heap until GC; null local refs to release sooner */ bedrockCreds = null; }
-  const resp = await fetch(url, { method: 'POST', headers: hdrs, body });
-  if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.message || e['message'] || `Bedrock error ${resp.status}`); }
-  const data = await resp.json();
-  const raw  = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+  const userContent = `Analyze this firmware release for model "${modelId}" version "${fwVersion}" (repos: ${repoSummary}).
+
+## TICKETS & CODE CHANGES
+${ticketFullDetails || ticketList}
+
+${projKey ? `Jira project key: ${projKey}` : ''}`;
+
+  const messages = [{ role: 'user', content: userContent }];
+
+  let data = await bedrockInvoke(url, messages, tools.length ? tools : undefined, creds);
+  log(`Bedrock turn 1: stop_reason=${data.stop_reason}`, 'info');
+
+  // Agentic tool-use loop — Bedrock drives Zephyr/Confluence queries
+  let turns = 0;
+  while (data.stop_reason === 'tool_use' && turns < 15) {
+    turns++;
+    const assistantContent = data.content || [];
+    messages.push({ role: 'assistant', content: assistantContent });
+
+    const toolResults = [];
+    for (const block of assistantContent) {
+      if (block.type !== 'tool_use') continue;
+      log(`Bedrock → ${block.name}(${JSON.stringify(block.input).slice(0, 120)})`, 'tool');
+      let result;
+      try {
+        result = await client.callTool(block.name, block.input);
+      } catch (e) {
+        result = `Error: ${e.message}`;
+      }
+      log(`  ← ${result.length} chars`, 'tool');
+      toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result });
+    }
+
+    messages.push({ role: 'user', content: toolResults });
+    data = await bedrockInvoke(url, messages, tools, creds);
+    log(`Bedrock turn ${turns + 1}: stop_reason=${data.stop_reason}`, 'info');
+  }
+
+  const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
   const parsed = parseJsonFromText(raw);
   if (!parsed) throw new Error('Could not parse risk assessment from Bedrock response');
   return parsed;
@@ -1667,6 +1617,24 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
         </table>` : '<div style="padding:12px;color:var(--hint);font-size:12px">No test cycle recommendations generated.</div>'}
       </div>
 
+      ${(assessment.coverage_gaps||[]).length ? `
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">Coverage gaps</span>
+          <span class="section-count" style="color:var(--r-high)">${assessment.coverage_gaps.length}</span>
+        </div>
+        <table class="cycle-table">
+          <thead><tr><th>Area</th><th>Tickets</th><th>Gap</th></tr></thead>
+          <tbody>
+            ${assessment.coverage_gaps.map(g => `<tr>
+              <td><span class="cycle-name">${g.area||''}</span></td>
+              <td><span style="font-family:var(--mono);font-size:10px;color:var(--accent2)">${(g.tickets||[]).join(', ')}</span></td>
+              <td><span class="cycle-reason">${g.reason||''}</span></td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>` : ''}
+
       <div class="section">
         <div class="section-header"><span class="section-title">QA advice</span></div>
         <div class="advice-box"><p>${assessment.key_advice}</p></div>
@@ -1775,8 +1743,8 @@ async function runAssessment() {
       'Connecting to Arlochat MCP',
       step1Label,
       'Jira: full ticket details',
-      'Confluence + Zephyr: docs + template test cycles',
-      bedrockCreds ? 'Bedrock Claude risk analysis' : 'Rule-based risk analysis'
+      bedrockCreds ? 'Bedrock: querying Zephyr + Confluence' : 'Confluence + Zephyr: docs + template test cycles',
+      bedrockCreds ? 'Bedrock: finalising risk assessment' : 'Rule-based risk analysis'
     ]);
     const client = new McpClient(
       `${window.location.origin}/mcp/sse`,
@@ -1797,19 +1765,24 @@ async function runAssessment() {
 
       activateStep(2);
       const { tickets, fullDetails } = await fetchJiraDetailsViaMcp(ticketKeys, client);
+      const projKey = primaryProject(ticketKeys);
 
       activateStep(3);
-      const projKey = primaryProject(ticketKeys);
-      const [confluenceContext, zephyrCycles] = await Promise.all([
-        fetchConfluenceContextViaMcp(modelId, client).catch(() => ''),
-        fetchZephyrTestCyclesViaMcp(projKey, modelId, client).catch(() => '')
-      ]);
-      log(`Confluence: ${confluenceContext.length} chars | Zephyr: ${zephyrCycles.length} chars`, 'info');
-
-      activateStep(4);
-      const assessment = bedrockCreds
-        ? await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, bedrockCreds, { ticketFullDetails: fullDetails, confluenceContext, zephyrCycles })
-        : ruleBasedAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used);
+      let assessment;
+      if (bedrockCreds) {
+        // Bedrock drives Zephyr + Confluence queries itself via tool use
+        activateStep(4);
+        assessment = await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, bedrockCreds, { ticketFullDetails: fullDetails, projKey, mcpClient: client });
+      } else {
+        // Rule-based: pre-fetch Zephyr + Confluence and score locally
+        const [confluenceContext, zephyrCycles] = await Promise.all([
+          fetchConfluenceContextViaMcp(modelId, client).catch(() => ''),
+          fetchZephyrTestCyclesViaMcp(projKey, modelId, client).catch(() => '')
+        ]);
+        log(`Confluence: ${confluenceContext.length} chars | Zephyr: ${zephyrCycles.length} chars`, 'info');
+        activateStep(4);
+        assessment = ruleBasedAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used);
+      }
 
       setTimeout(() => renderResults(assessment, tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, dataSource), 300);
     } catch(e) {
