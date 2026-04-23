@@ -488,7 +488,7 @@
         </div>
         <div class="field">
           <label>Model ID</label>
-          <input type="text" id="bedrock-model" value="us.anthropic.claude-sonnet-4-5-20251001-v1:0" autocomplete="off" spellcheck="false" style="font-size:10px" />
+          <input type="text" id="bedrock-model" value="global.anthropic.claude-opus-4-6-v1" autocomplete="off" spellcheck="false" style="font-size:10px" />
         </div>
       </div>
       <div class="api-note">
@@ -1742,7 +1742,7 @@ async function runAssessment() {
       secret,
       token:        document.getElementById('bedrock-token').value.trim() || null,
       region:       document.getElementById('bedrock-region').value.trim() || 'us-east-1',
-      bedrockModel: document.getElementById('bedrock-model').value.trim() || 'us.anthropic.claude-sonnet-4-5-20251001-v1:0',
+      bedrockModel: document.getElementById('bedrock-model').value.trim() || 'global.anthropic.claude-opus-4-6-v1',
     };
   })();
 
