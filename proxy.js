@@ -13,6 +13,52 @@ const PORT        = 8082;
 const TARGET_HOST = 'internal-arlochat-mcp-alb-880426873.us-east-1.elb.amazonaws.com';
 const TARGET_PORT = 8080;
 
+// ── DEBUG HELPERS ────────────────────────────────────────────────────────────
+const TRUNCATE = 400;
+
+function fmt(s, limit = TRUNCATE) {
+  s = String(s).replace(/\n|\r/g, ' ');
+  return s.length > limit ? s.slice(0, limit) + '…' : s;
+}
+
+function logCall(bodyBuf, respBuf, elapsedMs) {
+  let req;
+  try { req = JSON.parse(bodyBuf.toString()); } catch { return; }
+
+  const method = req.method || '?';
+  if (method === 'initialize' || method === 'notifications/initialized') return;
+
+  if (method === 'tools/call') {
+    const name  = (req.params || {}).name || '?';
+    const args  = (req.params || {}).arguments || {};
+    const argsS = fmt(JSON.stringify(args), 250);
+    console.log(`[mcp] CALL  ${name}  args=${argsS}  (${elapsedMs}ms)`);
+
+    try {
+      const resp = JSON.parse(respBuf.toString());
+      if (resp.error) {
+        console.log(`[mcp]   ERROR  ${JSON.stringify(resp.error)}`);
+        return;
+      }
+      const content = ((resp.result || {}).content || []);
+      const text = content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+      console.log(`[mcp]   OK  ${text.length} chars  preview=${fmt(text)}`);
+    } catch (e) {
+      console.log(`[mcp]   resp(raw)=${fmt(respBuf.toString())}  parse_err=${e.message}`);
+    }
+
+  } else if (method === 'tools/list') {
+    try {
+      const resp = JSON.parse(respBuf.toString());
+      const tools = ((resp.result || {}).tools || []).map(t => t.name);
+      console.log(`[mcp] tools/list -> [${tools.join(', ')}]`);
+    } catch { console.log(`[mcp] tools/list  (${elapsedMs}ms)`); }
+
+  } else {
+    console.log(`[mcp] ${method}  (${elapsedMs}ms)`);
+  }
+}
+
 const MIME = {
   '.html': 'text/html',
   '.js':   'application/javascript',
@@ -71,6 +117,19 @@ function proxySSE(req, res) {
             res.write('data: ' + rewritten + '\n');
             pendingEvent = '';
 
+          } else if (line.startsWith('data:')) {
+            // Log JSON-RPC push events (tool results sent back over SSE)
+            const payload = line.slice(5).trim();
+            if (payload.length > 10) {
+              try {
+                const msg = JSON.parse(payload);
+                if ('result' in msg || 'error' in msg) {
+                  console.log(`[sse]  push id=${msg.id ?? '?'}  ${fmt(payload)}`);
+                }
+              } catch { /* not JSON, ignore */ }
+            }
+            res.write(line + '\n');
+
           } else {
             res.write(line + '\n');
           }
@@ -93,12 +152,12 @@ function proxySSE(req, res) {
 
 function proxyPost(req, res) {
   const targetPath = req.url.replace(/^\/mcp/, '');
-  console.log('[proxy] POST ->', TARGET_HOST + ':' + TARGET_PORT + targetPath);
 
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
   req.on('end', () => {
     const body = Buffer.concat(chunks);
+    const t0 = Date.now();
     const upstream = http.request(
       { host: TARGET_HOST, port: TARGET_PORT, path: targetPath,
         method: 'POST',
@@ -107,9 +166,11 @@ function proxyPost(req, res) {
         const parts = [];
         upRes.on('data', (c) => parts.push(c));
         upRes.on('end', () => {
+          const respBuf = Buffer.concat(parts);
+          logCall(body, respBuf, Date.now() - t0);
           cors(res);
           res.writeHead(upRes.statusCode);
-          res.end(Buffer.concat(parts));
+          res.end(respBuf);
         });
       }
     );
