@@ -1466,7 +1466,7 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
     },
     {
       name: 'zephyr_get_executions',
-      description: 'Get test executions (test cases and their steps) for a specific Zephyr test cycle.',
+      description: 'Get test executions for a Zephyr cycle. Use sparingly — only when the cycle name alone is ambiguous. Maximum 2 calls total.',
       input_schema: {
         type: 'object',
         properties: {
@@ -1499,12 +1499,12 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
 
   const systemPrompt = `You are a senior firmware QA engineer at Arlo. Your job is to analyze a firmware release and produce a structured risk assessment with accurate test cycle recommendations.
 
-${client ? `You have access to Zephyr and Confluence tools. Use them as follows:
-1. Call zephyr_list(type="folders", project_key="${projKey}") to find the template folder for this device project.
-2. Call zephyr_list(type="cycles", project_key="${projKey}", folder_id=<template_folder_id>) to list all cycles in that folder.
-3. For each cycle that looks relevant to the changes, call zephyr_get_executions or zephyr_list(type="test_cases") to read its actual test cases so you understand what it covers.
-4. Optionally call confluence_search to find model-specific documentation if you need more context about the device architecture.
-Only recommend cycles you have actually read — use their exact names from Zephyr. Do not invent or paraphrase cycle names.` : ''}
+${client ? `You have access to Zephyr and Confluence tools. Follow these steps exactly — minimise tool calls:
+1. Call zephyr_list(type="folders", project_key="${projKey}") to find the template folder.
+2. Call zephyr_list(type="cycles", project_key="${projKey}", folder_id=<template_folder_id>) to get the full cycle list.
+3. Use the cycle NAMES from step 2 to decide which are relevant — cycle names are descriptive enough. Do NOT call zephyr_get_executions for every cycle. Only call it for at most 2 cycles where the name alone is genuinely ambiguous.
+4. Do NOT call confluence_search unless a ticket explicitly mentions an architecture question you cannot answer from the ticket text alone.
+Use the exact cycle names from Zephyr. Do not invent or paraphrase cycle names.` : ''}
 
 After gathering context, return ONLY valid JSON (no markdown fences):
 {
