@@ -754,53 +754,59 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client, swVersion = '')
   const ghTool = toolNames.find(t => t === 'github_cli') || toolNames.find(t => t.includes('github')) || 'github_cli';
   log(`Using GitHub tool: ${ghTool}`, 'info');
 
-  // Find all repos in org
-  const repoRaw = await client.callTool(ghTool, {
-    command: `repo list arlo-engineering --limit 200 --json name --jq '[.[].name]'`
-  });
-  let allRepoNames = [];
-  try { allRepoNames = JSON.parse(repoRaw); } catch {}
-
-  // Filter candidates
-  const modelLower = modelId.toLowerCase();
-  const fallback = ['camif-mcu-harpy', 'camif-isp2mcu', 'nim', 'sv_rk1103b', 'fwbabycam'];
-  let candidates = allRepoNames.filter(r =>
-    r.toLowerCase().includes(modelLower) || r.toLowerCase().startsWith('camif') ||
-    r.toLowerCase().startsWith('fw') || r === 'nim' || r === 'sv_rk1103b'
-  );
-  if (!candidates.length) candidates = fallback;
-  candidates = candidates.slice(0, 6);
-  log(`Repos to search: ${candidates.join(', ')}`, 'info');
-
   const refsUsed = {}, allCommits = [];
+  let candidates = [];
 
-  for (const repo of candidates) {
-    // Find ref matching fwVersion
-    const tagsRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
-    let ref = 'master';
-    try {
-      const tags = JSON.parse(tagsRaw);
-      const match = tags.find(t => t.includes(fwVersion) || fwVersion.includes(t.replace(/^v/, '')));
-      if (match) { ref = match; }
-      else {
-        const brRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
-        const branches = JSON.parse(brRaw || '[]');
-        const bMatch = branches.find(b => b.includes(fwVersion)) || branches.find(b => b.includes('release'));
-        if (bMatch) ref = bMatch;
-      }
-    } catch {}
+  // Skip firmware search entirely when only SW/client version is provided
+  const fwSearch = !!(modelId || fwVersion);
 
-    const commitsRaw = await client.callTool(ghTool, {
-      command: `api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
+  if (fwSearch) {
+    // Find all repos in org
+    const repoRaw = await client.callTool(ghTool, {
+      command: `repo list arlo-engineering --limit 200 --json name --jq '[.[].name]'`
     });
-    try {
-      const parsed = JSON.parse(commitsRaw);
-      if (Array.isArray(parsed) && parsed.length) {
-        allCommits.push(...parsed);
-        refsUsed[repo] = ref;
-        log(`${repo}@${ref}: ${parsed.length} commits`, 'success');
-      }
-    } catch {}
+    let allRepoNames = [];
+    try { allRepoNames = JSON.parse(repoRaw); } catch {}
+
+    // Filter candidates
+    const modelLower = modelId.toLowerCase();
+    const fallback = ['camif-mcu-harpy', 'camif-isp2mcu', 'nim', 'sv_rk1103b', 'fwbabycam'];
+    candidates = allRepoNames.filter(r =>
+      (modelLower && r.toLowerCase().includes(modelLower)) || r.toLowerCase().startsWith('camif') ||
+      r.toLowerCase().startsWith('fw') || r === 'nim' || r === 'sv_rk1103b'
+    );
+    if (!candidates.length) candidates = fallback;
+    candidates = candidates.slice(0, 6);
+    log(`FW repos to search: ${candidates.join(', ')}`, 'info');
+
+    for (const repo of candidates) {
+      // Find ref matching fwVersion
+      const tagsRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
+      let ref = 'master';
+      try {
+        const tags = JSON.parse(tagsRaw);
+        const match = tags.find(t => t.includes(fwVersion) || fwVersion.includes(t.replace(/^v/, '')));
+        if (match) { ref = match; }
+        else {
+          const brRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
+          const branches = JSON.parse(brRaw || '[]');
+          const bMatch = branches.find(b => b.includes(fwVersion)) || branches.find(b => b.includes('release'));
+          if (bMatch) ref = bMatch;
+        }
+      } catch {}
+
+      const commitsRaw = await client.callTool(ghTool, {
+        command: `api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
+      });
+      try {
+        const parsed = JSON.parse(commitsRaw);
+        if (Array.isArray(parsed) && parsed.length) {
+          allCommits.push(...parsed);
+          refsUsed[repo] = ref;
+          log(`${repo}@${ref}: ${parsed.length} commits`, 'success');
+        }
+      } catch {}
+    }
   }
 
   // iOS / Android search when SW/client version is provided
