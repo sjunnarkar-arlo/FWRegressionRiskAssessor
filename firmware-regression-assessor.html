@@ -1381,7 +1381,7 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
   const tools = client ? [
     {
       name: 'zephyr_list',
-      description: 'List Zephyr folders, test cycles, or test cases. Use type="folders" to find the template folder, type="cycles" with folder_id to list cycles in that folder, type="test_cases" with cycle_id to list test cases in a cycle.',
+      description: 'List Zephyr folders, test cycles, or test cases. Use type="folders" with project_key="FWQE" to find the regression template folder, type="cycles" with folder_id to list cycles in that folder, type="test_cases" with cycle_id to read test cases in a cycle.',
       input_schema: {
         type: 'object',
         properties: {
@@ -1396,7 +1396,7 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
     },
     {
       name: 'zephyr_get_executions',
-      description: 'Get test executions (test cases and their steps) for a specific Zephyr test cycle.',
+      description: 'Get test executions (test cases and their steps) for a specific Zephyr test cycle. Use project_key="FWQE" for firmware regression template cycles.',
       input_schema: {
         type: 'object',
         properties: {
@@ -1429,12 +1429,17 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
 
   const systemPrompt = `You are a senior firmware QA engineer at Arlo. Your job is to analyze a firmware release and produce a structured risk assessment with accurate test cycle recommendations.
 
-${client ? `You have access to Zephyr and Confluence tools. Use them as follows:
-1. Call zephyr_list(type="folders", project_key="${projKey}") to find the template folder for this device project.
-2. Call zephyr_list(type="cycles", project_key="${projKey}", folder_id=<template_folder_id>) to list all cycles in that folder.
-3. For each cycle that looks relevant to the changes, call zephyr_get_executions or zephyr_list(type="test_cases") to read its actual test cases so you understand what it covers.
-4. Optionally call confluence_search to find model-specific documentation if you need more context about the device architecture.
-Only recommend cycles you have actually read — use their exact names from Zephyr. Do not invent or paraphrase cycle names.` : ''}
+${client ? `You have access to Zephyr and Confluence tools. Follow these steps in order:
+
+1. Call zephyr_list(type="folders", project_key="FWQE") to list folders in the FWQE Zephyr project.
+2. Find the folder whose name contains "regression template" (case-insensitive). If multiple match, prefer the most specific one.
+3. Call zephyr_list(type="cycles", project_key="FWQE", folder_id=<regression_template_folder_id>) to list all cycles in that folder.
+4. For each cycle whose name suggests relevance to the changes (based on functional area), call zephyr_get_executions(cycle_id=<id>, project_key="FWQE") or zephyr_list(type="test_cases", cycle_id=<id>, project_key="FWQE") to read its actual test cases and confirm what it covers.
+5. Recommend only cycles you have actually read from the FWQE regression template folder — use their exact names as they appear in Zephyr.
+
+If you cannot find the FWQE project, the regression template folder, or any cycles within it, fall back to generating cycle names based on the functional areas affected by the tickets (e.g. "BLE Onboarding Regression", "Wi-Fi Regression", "OTA Regression"). In that case, set a "coverage_gaps" entry noting that Zephyr template could not be accessed.
+
+Optionally call confluence_search to find model-specific documentation if you need more context about the device architecture.` : ''}
 
 After gathering context, return ONLY valid JSON (no markdown fences):
 {
