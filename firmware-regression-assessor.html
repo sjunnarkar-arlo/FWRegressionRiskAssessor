@@ -652,40 +652,6 @@ function showError(msg) {
   document.getElementById('btn-text').textContent = 'RUN ASSESSMENT';
 }
 
-// ── MCP CALL HELPER ──────────────────────────────────────
-async function mcpCall(anthropicKey, userPrompt, maxTokens = 8000) {
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': anthropicKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'mcp-client-2025-04-04',
-      'anthropic-dangerous-direct-browser-access': 'true'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: maxTokens,
-      tools: [{
-        type: 'mcp',
-        name: 'arlochat',
-        url: 'https://internal-arlochat-mcp-alb-880426873.us-east-1.elb.amazonaws.com:8080/sse'
-      }],
-      messages: [{ role: 'user', content: userPrompt }]
-    })
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    throw new Error(err.error?.message || `API error ${resp.status}`);
-  }
-  const data = await resp.json();
-  return data.content || [];
-}
-
-function extractText(blocks) {
-  return blocks.filter(b => b.type === 'text').map(b => b.text).join('\n');
-}
-
 function parseJsonFromText(text) {
   const clean = text.replace(/```json|```/g, '').trim();
   // Try full parse first
@@ -696,63 +662,6 @@ function parseJsonFromText(text) {
   const arrMatch = clean.match(/\[[\s\S]*\]/);
   if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch(e) {}
   return null;
-}
-
-// ── STEP 1: AGENTIC REPO + COMMIT DISCOVERY ─────────────
-// Single agentic MCP call. Claude figures out:
-//   - which repos in arlo-engineering are relevant for this model
-//   - which branch/tag corresponds to this FW version
-//   - fetches the commits for that range
-// Returns parsed commit data with ticket keys extracted.
-async function discoverCommits(modelId, fwVersion, anthropicKey) {
-  const prompt = `You are a firmware release engineer at Arlo. Use the github_cli tool to find all commits related to a firmware release for model "${modelId}", version "${fwVersion}" in the arlo-engineering GitHub org.
-
-Follow these steps using the github_cli tool:
-
-1. First, identify the relevant firmware repositories for "${modelId}". Known repos include: camif-mcu-harpy, camif-isp2mcu, nim, sv_rk1103b, fwbabycam, camif-isp-harpy. Use your knowledge of which repos are relevant for this model name (e.g. "Harpy" → camif-mcu-harpy + camif-isp2mcu, "Lory"/"PEGA" → camif-mcu-harpy + camif-isp2mcu + nim, generic model IDs → search all likely candidates).
-
-2. For each relevant repo, find the branch or tag that corresponds to version "${fwVersion}". Try:
-   - gh api repos/arlo-engineering/{repo}/branches --jq '[.[].name]' to list branches
-   - Look for branches matching the version string, release branches like "release/...", or master/main if nothing version-specific exists
-   - gh api repos/arlo-engineering/{repo}/tags --jq '[.[].name]' to check for version tags
-
-3. For each identified repo+ref, fetch recent commits:
-   - If you found a version-specific branch or tag, compare it against the previous release branch/tag:
-     gh api repos/arlo-engineering/{repo}/compare/{prev}...{current} --jq '[.commits[] | {sha: .sha[0:8], msg: .commit.message, repo: "{repo}"}]'
-   - If only master/main exists, fetch the last 60 commits:
-     gh api "repos/arlo-engineering/{repo}/commits?sha=master&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "{repo}"}]'
-
-4. Collect ALL commits from ALL relevant repos into one list.
-
-Return ONLY a JSON object in this exact format, no explanation:
-{
-  "repos_searched": ["repo1", "repo2"],
-  "refs_used": {"repo1": "branch-or-tag", "repo2": "branch-or-tag"},
-  "commits": [
-    {"sha": "abcd1234", "msg": "PEGA-123: fix something", "repo": "camif-mcu-harpy"},
-    ...
-  ]
-}`;
-
-  const blocks = await mcpCall(anthropicKey, prompt, 12000);
-  const text = extractText(blocks);
-  const parsed = parseJsonFromText(text);
-
-  if (!parsed || !Array.isArray(parsed.commits)) {
-    // Try pulling from mcp_tool_result blocks directly as fallback
-    let allCommits = [];
-    for (const b of blocks) {
-      if (b.type === 'mcp_tool_result') {
-        const t = b.content?.[0]?.text || '';
-        const arr = parseJsonFromText(t);
-        if (Array.isArray(arr)) allCommits = allCommits.concat(arr);
-      }
-    }
-    if (!allCommits.length) throw new Error(`Could not find commits for ${modelId} ${fwVersion}. Try the demo mode (leave key blank) to see expected output.`);
-    return { repos_searched: [], refs_used: {}, commits: allCommits };
-  }
-
-  return parsed;
 }
 
 // ── EXTRACT TICKET KEYS FROM COMMITS ────────────────────
@@ -780,54 +689,6 @@ function extractTicketKeys(commits) {
   }
 
   return { commitData, ticketKeys: [...seen] };
-}
-
-// ── STEP 2: FETCH JIRA DETAILS ───────────────────────────
-async function fetchJiraDetails(ticketKeys, anthropicKey) {
-  if (!ticketKeys.length) return [];
-  const keyList = ticketKeys.map(k => `"${k}"`).join(', ');
-  const jql = `issueKey in (${keyList}) ORDER BY priority ASC`;
-
-  const prompt = `Use the jira_search tool with this JQL: ${jql}
-Use fields: summary,priority,status,assignee. Set limit to ${ticketKeys.length + 5}.
-Return ONLY a JSON array. Each item: {"key":"...","summary":"...","priority":"...","status":"...","assignee":"..."}
-No explanation, no markdown fences.`;
-
-  const blocks = await mcpCall(anthropicKey, prompt, 6000);
-  const raw = extractText(blocks);
-  const extractProject = k => k ? k.replace(/-\d+$/, '') : '?';
-  const normPri = raw => {
-    const s = (raw || '').toString().toUpperCase();
-    if (s === 'P0' || s.includes('BLOCKER')) return 'P0';
-    if (s === 'P1' || s.includes('CRITICAL')) return 'P1';
-    if (s === 'P3' || s.includes('MINOR')) return 'P3';
-    return 'P2';
-  };
-
-  const arr = parseJsonFromText(raw);
-  if (Array.isArray(arr) && arr.length) {
-    return arr.map(t => ({
-      key: t.key || '', project: extractProject(t.key),
-      summary: t.summary || '(no summary)',
-      priority: normPri(t.priority), status: t.status || '', assignee: t.assignee || ''
-    })).filter(t => t.key);
-  }
-
-  // Fallback: markdown table
-  const lines = raw.split('\n').filter(l => l.startsWith('|') && !l.includes('---'));
-  if (lines.length > 1) {
-    const headers = lines[0].split('|').map(h => h.trim().toLowerCase()).filter(Boolean);
-    return lines.slice(1).map(row => {
-      const cells = row.split('|').map(c => c.trim()).filter(Boolean);
-      const obj = {};
-      headers.forEach((h, i) => { obj[h] = cells[i] || ''; });
-      const key = obj['key'] || '';
-      return { key, project: extractProject(key), summary: obj['summary'] || '', priority: normPri(obj['priority']), status: obj['status'] || '', assignee: obj['assignee'] || '' };
-    }).filter(t => t.key);
-  }
-
-  // Last resort: stubs so the assessment can still run
-  return ticketKeys.map(k => ({ key: k, project: extractProject(k), summary: '(Jira fetch failed)', priority: 'P2', status: '', assignee: '' }));
 }
 
 // ── JIRA NORMALIZER (shared) ─────────────────────────────
@@ -1506,8 +1367,8 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
 ## TICKETS & CODE CHANGES
 ${ticketFullDetails || ticketList}
 
-${confluenceContext ? `## CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 2000)}\n` : ''}
-${hasZephyr ? `## ZEPHYR TEMPLATE FOLDER — TEST CYCLES & TEST CASES\nThe following data comes from the Zephyr template folder for this device's project. It includes cycle names and the test cases inside each cycle.\n\n${zephyrCycles.slice(0, 6000)}\n` : ''}
+${confluenceContext ? `## CONFLUENCE CONTEXT (model docs / firmware notes)\n${confluenceContext.slice(0, 8000)}\n` : ''}
+${hasZephyr ? `## ZEPHYR TEMPLATE FOLDER — TEST CYCLES & TEST CASES\nThe following data comes from the Zephyr template folder for this device's project. It includes cycle names and the test cases inside each cycle.\n\n${zephyrCycles.slice(0, 20000)}\n` : ''}
 
 Your task:
 1. For each ticket, identify which functional area it affects (e.g. BLE Onboarding, OTA/FOTA, Wi-Fi, Audio, Streaming, Camera Pipeline, MCU/RTOS, Storage, Doorbell, etc.).
