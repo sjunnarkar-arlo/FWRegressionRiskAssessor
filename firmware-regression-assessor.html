@@ -502,6 +502,14 @@
         <label>Web Client version</label>
         <input type="text" id="web-version" placeholder="e.g. 6.24.0" />
       </div>
+      <div class="field">
+        <label>Extra Zephyr projects (Android) <span style="font-size:10px;color:var(--hint)">(comma · optional)</span></label>
+        <input type="text" id="android-zephyr-project" placeholder="defaults: ANDAPP + FW ticket projects" style="font-size:11px" />
+      </div>
+      <div class="field">
+        <label>Extra Zephyr projects (iOS) <span style="font-size:10px;color:var(--hint)">(comma · optional)</span></label>
+        <input type="text" id="ios-zephyr-project" placeholder="defaults: IOSAPP + FW ticket projects" style="font-size:11px" />
+      </div>
     </div>
 
     <div class="sidebar-section">
@@ -1317,8 +1325,206 @@ async function fetchConfluenceContextViaMcp(modelId, client) {
   return context;
 }
 
+/** If MCP wrapped prose + JSON, isolate first balanced `{...}` or `[...]` substring. */
+function coerceZephyrJsonPayload(raw) {
+  const s = String(raw || '').trim();
+  if (s.startsWith('{') || s.startsWith('[')) return s;
+  const i = s.indexOf('{');
+  if (i >= 0) {
+    let depth = 0;
+    for (let j = i; j < s.length; j++) {
+      if (s[j] === '{') depth++;
+      else if (s[j] === '}') {
+        depth--;
+        if (depth === 0) return s.slice(i, j + 1);
+      }
+    }
+  }
+  const k = s.indexOf('[');
+  if (k >= 0) {
+    let depth = 0;
+    for (let j = k; j < s.length; j++) {
+      if (s[j] === '[') depth++;
+      else if (s[j] === ']') {
+        depth--;
+        if (depth === 0) return s.slice(k, j + 1);
+      }
+    }
+  }
+  return s;
+}
+
+/** True when zephyr_list returned an HTTP/tool error string instead of JSON cycles. */
+function isZephyrErrorPayload(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return false;
+  if (/^Error:\s/i.test(s)) return true;
+  if (/\b404\b/.test(s) && /not found|Not Found/i.test(s)) return true;
+  if (/\b40[13]\b/.test(s) && /forbidden|unauthor/i.test(s)) return true;
+  return false;
+}
+
+/** Arlochat zephyr_list often returns a Python repr (single quotes, None) — JSON.parse cannot read it. */
+function normalizeZephyrMcpPythonDictToJson(raw) {
+  const t = String(raw || '').trim();
+  if (!t) return t;
+  try {
+    JSON.parse(coerceZephyrJsonPayload(t));
+    return t;
+  } catch (_) {}
+  if (!t.startsWith('{') || !/'(items|type|projectKey)'/.test(t)) return t;
+  try {
+    let s = t.replace(/\bNone\b/g, 'null').replace(/\bTrue\b/g, 'true').replace(/\bFalse\b/g, 'false');
+    s = s.replace(/'([a-zA-Z_][a-zA-Z0-9_]*)'\s*:/g, '"$1":');
+    s = s.replace(/:\s*'((?:\\.|[^'\\])*)'/g, (_, inner) => {
+      const un = inner.replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+      return ': ' + JSON.stringify(un);
+    });
+    JSON.parse(s);
+    return s;
+  } catch (_) {
+    return t;
+  }
+}
+
+/** Extract cycle IDs/keys from zephyr_list text (numeric id, UUID, Jira-style cycle `key`, nested arrays). */
+function extractZephyrCycleIds(cyclesRaw) {
+  if (!cyclesRaw || typeof cyclesRaw !== 'string') return [];
+  const normalized = normalizeZephyrMcpPythonDictToJson(cyclesRaw);
+  const ordered = [];
+  const seen = new Set();
+  function add(x) {
+    const s = String(x).trim();
+    if (!s || s === '-1' || s === 'null' || seen.has(s) || s.length > 80) return;
+    seen.add(s);
+    ordered.push(s);
+  }
+  const patterns = [
+    /"id"\s*:\s*(-?\d+)(?=[,\s}\]])/g,
+    /"id"\s*:\s*"(-?\d+)"/g,
+    /"id"\s*:\s*"([a-fA-F0-9]{8}-[a-fA-F0-9-]{27,36})"/g,
+    /'id'\s*:\s*(\d+)/g,
+    /"cycleId"\s*:\s*(-?\d+)(?=[,\s}\]])/g,
+    /"cycleId"\s*:\s*"([^"]+)"/g,
+    /"key"\s*:\s*"([A-Z][A-Z0-9]+-\d+)"/g,
+    /'key'\s*:\s*'([A-Z][A-Z0-9]+-\d+)'/g,
+  ];
+  for (const re of patterns) {
+    for (const m of normalized.matchAll(re)) {
+      if (m[1]) add(m[1]);
+    }
+  }
+  try {
+    const t = coerceZephyrJsonPayload(normalized.trim());
+    if ((t.startsWith('{') || t.startsWith('[')) && t.length < 900000) {
+      const j = JSON.parse(t);
+      const visitArrays = [];
+      const scan = (node, depth) => {
+        if (depth > 35 || node == null) return;
+        if (Array.isArray(node)) {
+          visitArrays.push(node);
+          node.forEach(n => scan(n, depth + 1));
+          return;
+        }
+        if (typeof node !== 'object') return;
+        for (const k of ['values', 'cycles', 'items', 'content', 'data', 'searchResult', 'entities', 'results']) {
+          if (Array.isArray(node[k])) visitArrays.push(node[k]);
+        }
+        for (const v of Object.values(node)) {
+          if (Array.isArray(v) && v.length && v[0] && typeof v[0] === 'object') visitArrays.push(v);
+          else if (v && typeof v === 'object') scan(v, depth + 1);
+        }
+      };
+      scan(j, 0);
+      for (const arr of visitArrays) {
+        for (const item of arr) {
+          if (!item || typeof item !== 'object') continue;
+          const key = typeof item.key === 'string' ? item.key : '';
+          const id = item.id != null ? item.id : item.cycleId;
+          const ident = id != null && String(id) !== '[object Object]' ? String(id) : (key || '');
+          if (!ident) continue;
+          const hasLabel = !!(item.name || item.versionName || item.title || key);
+          if (!hasLabel) continue;
+          add(ident);
+        }
+      }
+    }
+  } catch (_) {}
+  return ordered;
+}
+
+/** Prefer cycles whose name/version fields match FW or app version (works with nested JSON). */
+function zephyrPreferCycleIdsByName(cyclesRaw, allIds, baseVersion, modelId, clientAppMode, clientNameHints = []) {
+  const versionLower = (baseVersion || '').toLowerCase();
+  const modelLower = (modelId || '').toLowerCase();
+  const hints = (clientNameHints || []).map(h => String(h).toLowerCase()).filter(Boolean);
+  const wantName = (label) => {
+    const n = (label || '').toLowerCase();
+    if (clientAppMode) {
+      if (!versionLower || !n.includes(versionLower)) return false;
+      if (hints.length) return hints.some(h => n.includes(h));
+      return true;
+    }
+    return (!!versionLower && n.includes(versionLower)) || (!!modelLower && n.includes(modelLower));
+  };
+  const matched = [];
+  const seen = new Set();
+  function addm(id) {
+    const s = String(id);
+    if (!s || s === 'null' || seen.has(s) || s.length > 80) return;
+    seen.add(s);
+    matched.push(s);
+  }
+  try {
+    const normalized = normalizeZephyrMcpPythonDictToJson(cyclesRaw);
+    const t = coerceZephyrJsonPayload(normalized.trim());
+    if ((!t.startsWith('{') && !t.startsWith('[')) || t.length > 900000) return allIds;
+    const j = JSON.parse(t);
+    const consider = (item) => {
+      if (!item || typeof item !== 'object') return;
+      const jpv = item.jiraProjectVersion;
+      const jpvBits = jpv && typeof jpv === 'object'
+        ? [jpv.name, jpv.versionName, jpv.version, jpv.description].filter(Boolean).join(' ')
+        : (typeof jpv === 'string' ? jpv : '');
+      const label = [item.name, item.versionName, item.title, item.key, item.description, jpvBits].filter(Boolean).join(' ');
+      const id = item.id != null ? item.id : item.cycleId;
+      const ident = id != null && String(id) !== '[object Object]' ? String(id) : (typeof item.key === 'string' ? item.key : '');
+      if (!ident || !label) return;
+      if (!wantName(label)) return;
+      addm(ident);
+    };
+    const walk = (node, d) => {
+      if (d > 40 || node == null) return;
+      if (Array.isArray(node)) {
+        for (const it of node) {
+          consider(it);
+          walk(it, d + 1);
+        }
+        return;
+      }
+      if (typeof node !== 'object') return;
+      for (const k of ['values', 'cycles', 'items', 'content', 'data', 'searchResult', 'entities', 'results']) {
+        if (Array.isArray(node[k])) {
+          for (const it of node[k]) {
+            consider(it);
+            walk(it, d + 1);
+          }
+        }
+      }
+      for (const v of Object.values(node)) {
+        if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, d + 1);
+      }
+    };
+    walk(j, 0);
+  } catch (_) {}
+  return matched.length ? matched : allIds;
+}
+
 // ── DIRECT MCP: ZEPHYR TEST CYCLES + EXECUTION RESULTS ───
-async function fetchZephyrTestCyclesViaMcp(projectKeys, modelId, fwVersion, client) {
+// options.clientAppMode: when true, fwVersion is the app release (e.g. 6.25.0); match cycles by app version only, not camera modelId.
+async function fetchZephyrTestCyclesViaMcp(projectKeys, modelId, fwVersion, client, options = {}) {
+  const clientAppMode = !!options.clientAppMode;
+  const clientNameHints = Array.isArray(options.clientNameHints) ? options.clientNameHints : [];
   const tools = await client.listTools();
 
   // Flexible tool discovery: exact name first, then any tool with 'zephyr' in name
@@ -1336,8 +1542,10 @@ async function fetchZephyrTestCyclesViaMcp(projectKeys, modelId, fwVersion, clie
 
   const getExecTool = tools.find(t => t.name === 'zephyr_get_executions')?.name;
 
-  // Strip build hash: "0.100.159_b075390" → "0.100.159"
-  const baseVersion = fwVersion.replace(/_[a-f0-9]{6,}$/i, '').replace(/_b\d+$/i, '');
+  // FW: strip build hash "0.100.159_b075390" → "0.100.159". Client app: use fixVersion string as-is (e.g. 6.25.0).
+  const baseVersion = clientAppMode
+    ? String(fwVersion || '').trim()
+    : String(fwVersion || '').replace(/_[a-f0-9]{6,}$/i, '').replace(/_b\d+$/i, '');
   const keys = Array.isArray(projectKeys) ? projectKeys : [projectKeys];
 
   // Helper: count execution statuses from raw text
@@ -1358,16 +1566,18 @@ async function fetchZephyrTestCyclesViaMcp(projectKeys, modelId, fwVersion, clie
   let totalPassed = 0, totalFailed = 0, totalBlocked = 0;
 
   for (const projectKey of keys) {
-    // Step 1: Find template folder for this device/model
-    log(`Finding Zephyr folder for ${projectKey} (${modelId})…`, 'tool');
+    // Step 1: Find template folder for this device/model (FW) or generic app folders (client)
+    log(`Finding Zephyr folder for ${projectKey} (${clientAppMode ? `app ${baseVersion}` : modelId})…`, 'tool');
     let folderId = null;
     try {
       const foldersRaw = await client.callTool(listTool, { type: 'folders', project_key: projectKey });
-      const keywords = ['template', modelId?.toLowerCase(), 'regression'];
+      const keywords = clientAppMode
+        ? ['regression', 'release', 'template', 'smoke', 'sanity', baseVersion.toLowerCase()].filter(Boolean)
+        : ['template', modelId?.toLowerCase(), 'regression'].filter(Boolean);
       const folderEntries = [...foldersRaw.matchAll(/\{[^}]+\}/g)].map(m => m[0]);
       for (const entry of folderEntries) {
         const nameM = entry.match(/"name"\s*:\s*"([^"]+)"/i);
-        const idM   = entry.match(/"id"\s*:\s*"?(-?\d+)"?/i);
+        const idM   = entry.match(/"id"\s*:\s*"?(-?\d+|[a-fA-F0-9]{8}-[a-fA-F0-9-]{27,36})"?/i);
         if (nameM && idM && keywords.some(k => k && nameM[1].toLowerCase().includes(k))) {
           folderId = idM[1];
           log(`Folder: "${nameM[1]}" (id ${folderId})`, 'success');
@@ -1382,7 +1592,7 @@ async function fetchZephyrTestCyclesViaMcp(projectKeys, modelId, fwVersion, clie
     // Step 2: List cycles — try version-scoped first, then all
     log(`Listing cycles for ${projectKey}${folderId ? ' (template folder)' : ''}…`, 'tool');
     let cyclesRaw = '';
-    const cycleParamsBase = { type: 'cycles', project_key: projectKey, max_results: 60 };
+    const cycleParamsBase = { type: 'cycles', project_key: projectKey, max_results: clientAppMode ? 120 : 60 };
     if (folderId) cycleParamsBase.folder_id = folderId;
 
     // Try with version filter first
@@ -1405,35 +1615,35 @@ async function fetchZephyrTestCyclesViaMcp(projectKeys, modelId, fwVersion, clie
       continue;
     }
 
+    const zephyrListError = isZephyrErrorPayload(cyclesRaw);
+    const allIds = zephyrListError ? [] : extractZephyrCycleIds(cyclesRaw);
+    // #region agent log
+    if (clientAppMode) {
+      fetch('http://127.0.0.1:7262/ingest/d3dd6d7f-fa27-4176-98ba-4188dc1b6879',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f65e33'},body:JSON.stringify({sessionId:'f65e33',runId:'post-fix',hypothesisId:'F',location:'firmware-regression-assessor.html:zephyr:clientExtract',message:'Client Zephyr cycle list',data:{projectKey,cyclesLen:cyclesRaw.length,zephyrListError,idsFound:allIds.length,idsHead:allIds.slice(0,5),rawHead:cyclesRaw.slice(0,320)},timestamp:Date.now()})}).catch(()=>{});
+    }
+    // #endregion
+
+    if (zephyrListError) {
+      log(`Zephyr Scale: ${projectKey} — ${cyclesRaw.slice(0, 240)}`, 'info');
+      if (clientAppMode) {
+        log(`Client app Zephyr: this Scale projectKey returned an error (often 404). Add the correct key under "Extra Zephyr projects" or confirm cycles exist whose names include the app version and Android/iOS keywords.`, 'info');
+      }
+      continue;
+    }
+
     sections.push(`=== TEST CYCLES — ${projectKey} ===\n${cyclesRaw}`);
     log(`Cycles: ${cyclesRaw.length} chars`, 'success');
 
-    // Step 3: Extract cycle IDs — prefer cycles whose name contains the version
-    const allIds = [...cyclesRaw.matchAll(/"id"\s*:\s*"?(-?\d+)"?/g)]
-      .map(m => m[1])
-      .filter(id => id !== '-1' && id !== 'null')
-      .filter((v, i, a) => a.indexOf(v) === i);
+    // Step 3: Prefer cycles whose name matches FW or app version
+    if (!allIds.length && cyclesRaw.length > 80) {
+      log(`Zephyr: no parseable cycle IDs in ${projectKey} (${cyclesRaw.length} chars)`, 'info');
+    }
 
-    // Try to extract cycle names alongside IDs to prefer version-matching ones
-    let relevantIds = allIds;
-    try {
-      const cycleObjects = [...cyclesRaw.matchAll(/\{[^{}]{10,500}\}/g)].map(m => m[0]);
-      const versionLower = baseVersion.toLowerCase();
-      const modelLower   = modelId.toLowerCase();
-      const versionIds = cycleObjects
-        .filter(o => {
-          const nameM = o.match(/"name"\s*:\s*"([^"]+)"/i);
-          if (!nameM) return false;
-          const n = nameM[1].toLowerCase();
-          return n.includes(versionLower) || n.includes(modelLower);
-        })
-        .map(o => (o.match(/"id"\s*:\s*"?(-?\d+)"?/i) || [])[1])
-        .filter(Boolean);
-      if (versionIds.length) {
-        log(`Found ${versionIds.length} cycle(s) matching version/model — using those`, 'info');
-        relevantIds = versionIds;
-      }
-    } catch (_) {}
+    const preferred = zephyrPreferCycleIdsByName(cyclesRaw, allIds, baseVersion, modelId, clientAppMode, clientNameHints);
+    const relevantIds = (clientAppMode && clientNameHints.length)
+      ? (preferred.length ? preferred : [])
+      : (preferred.length ? preferred : allIds);
+    if (preferred.length) log(`Found ${preferred.length} cycle(s) matching version/model (JSON) — using those`, 'info');
 
     const cycleIds = relevantIds.slice(0, 10);
     if (!cycleIds.length) {
@@ -1470,8 +1680,9 @@ async function fetchZephyrTestCyclesViaMcp(projectKeys, modelId, fwVersion, clie
             : 'no status data';
 
           // Extract cycle name from cycles listing for readable summary
-          const nameInCycles = (cyclesRaw.match(new RegExp(`"id"\\s*:\\s*"?${cycleId}"?[^}]*"name"\\s*:\\s*"([^"]+)"`, 'i')) ||
-                                cyclesRaw.match(new RegExp(`"name"\\s*:\\s*"([^"]+)"[^}]*"id"\\s*:\\s*"?${cycleId}"?`, 'i')))?.[1] || `Cycle ${cycleId}`;
+          const escId = String(cycleId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const nameInCycles = (cyclesRaw.match(new RegExp(`"id"\\s*:\\s*"?${escId}"?[^}]{0,1200}?"name"\\s*:\\s*"([^"]+)"`, 'i')) ||
+                                cyclesRaw.match(new RegExp(`"name"\\s*:\\s*"([^"]+)"[^}]{0,1200}?"id"\\s*:\\s*"?${escId}"?`, 'i')))?.[1] || `Cycle ${cycleId}`;
           execSummaryLines.push(`  ${nameInCycles}: ${statusLine}`);
 
           sections.push(`=== CYCLE ${cycleId} (${nameInCycles}) — EXECUTIONS ===\n${execRaw.slice(0, 2500)}`);
@@ -1493,6 +1704,44 @@ async function fetchZephyrTestCyclesViaMcp(projectKeys, modelId, fwVersion, clie
   const execSummary = hasExec ? `\n=== EXECUTION SUMMARY ===\nTotal across all cycles — PASSED: ${totalPassed}, FAILED: ${totalFailed}, BLOCKED: ${totalBlocked}\nPer cycle:\n${execSummaryLines.join('\n')}\n` : '';
 
   return sections.join('\n\n') + execSummary;
+}
+
+/** Substrings matched (case-insensitive) in cycle **names** for client-app discovery (not Scale project keys). */
+const CLIENT_APP_CYCLE_NAME_HINTS = {
+  Android: ['android', 'andapp', 'arloandrd', 'andrd', 'mobile app', 'mobile'],
+  iOS: ['ios', 'iosapp', 'arloios', 'arloiosapp', 'iphone', 'ipad'],
+};
+
+function parseZephyrProjectKeyCsv(elementId) {
+  return (document.getElementById(elementId)?.value || '')
+    .split(/[,;\s]+/)
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+/** Scale project keys to scan: app defaults + FW ticket prefixes + optional sidebar extras. */
+function getClientZephyrSearchProjectKeys(platform, firmwareZephyrKeys) {
+  const fw = (firmwareZephyrKeys || []).map(k => String(k).trim().toUpperCase()).filter(Boolean);
+  const extraId = platform === 'Android' ? 'android-zephyr-project' : platform === 'iOS' ? 'ios-zephyr-project' : null;
+  const extra = extraId ? parseZephyrProjectKeyCsv(extraId) : [];
+  const defaults = platform === 'Android' ? ['ANDAPP'] : platform === 'iOS' ? ['IOSAPP'] : [];
+  return [...new Set([...defaults, ...extra, ...fw])];
+}
+
+async function fetchClientAppZephyrCyclesViaMcp(clientPlatformInputs, firmwareZephyrKeys, client) {
+  if (!Array.isArray(clientPlatformInputs) || !clientPlatformInputs.length) return '';
+  const chunks = [];
+  for (const { platform, version } of clientPlatformInputs) {
+    if (!(version || '').trim() || platform === 'Web Client') continue;
+    const searchKeys = getClientZephyrSearchProjectKeys(platform, firmwareZephyrKeys);
+    if (!searchKeys.length) continue;
+    const hints = CLIENT_APP_CYCLE_NAME_HINTS[platform] || [];
+    const ver = version.trim();
+    log(`Zephyr client app (${platform} ${ver}): scanning ${searchKeys.length} Scale project(s); cycles must include "${ver}" and app keywords in the name…`, 'info');
+    const block = await fetchZephyrTestCyclesViaMcp(searchKeys, '', ver, client, { clientAppMode: true, clientNameHints: hints });
+    if (block) chunks.push(block);
+  }
+  return chunks.join('\n\n');
 }
 
 
@@ -1675,17 +1924,22 @@ Rules:
 }
 
 // ── STEP 3b: CLAUDE SW ASSESSMENT (separate call) ────────
-async function claudeAssessSW(clientPlatforms, modelId, fwVersion, anthropicKey) {
+async function claudeAssessSW(clientPlatforms, modelId, fwVersion, anthropicKey, extras = {}) {
+  const { clientZephyrCycles = '' } = extras;
   const platformSection = clientPlatforms.map(p => {
     const tList = p.tickets.slice(0, 50).map(t => `- ${t.key} [${t.priority}]: ${t.summary}`).join('\n');
     return `### ${p.platform} ${p.version}\nGo/No Go page content:\n${p.goNoGoSummary.slice(0, 2500)}\n\nJira Release Tickets (${p.tickets.length} total):\n${tList || '(none retrieved)'}`;
   }).join('\n\n---\n\n');
 
+  const zephyrClientBlock = (clientZephyrCycles || '').trim()
+    ? `## ZEPHYR — CLIENT APP TEST CYCLES & EXECUTIONS\nCycles below were selected by **app version** (from the sidebar) plus **cycle name** hints (e.g. Android / ARLOANDRD-style names, iOS, ANDAPP, etc.) across ANDAPP, IOSAPP, FW ticket Zephyr projects, and any extra projects you listed. Prefer **exact cycle names** from this block in \`test_recommendations\` when they appear here.\n\n${clientZephyrCycles.trim().slice(0, 6500)}\n\n`
+    : '';
+
   const prompt = `You are a senior QA engineer at Arlo. Analyze the following client app releases that ship alongside firmware ${modelId} ${fwVersion}.
 
 ${platformSection}
 
-For each platform: identify which app features and user flows are impacted, assess risk, and recommend what to test.
+${zephyrClientBlock}For each platform: identify which app features and user flows are impacted, assess risk, and recommend what to test.
 
 Return ONLY valid JSON (no markdown fences):
 {
@@ -1710,7 +1964,7 @@ Return ONLY valid JSON (no markdown fences):
 Rules:
 - One entry per platform listed above.
 - areas_at_risk: 3-6 items, risk DESC. Use real Arlo app feature names: Device Setup & Onboarding, Live View & Streaming, Video Playback & CVR, Smart Alerts & Notifications, Subscription & IAP, Account & Settings, Modes & Rules, Share & Permissions, Push Notifications, App Performance & Stability.
-- test_recommendations: 4-8 items, P1 first. run_type "full" for high-risk flows, "regression" for medium, "smoke" for low.
+- test_recommendations: 4-8 items, P1 first. run_type "full" for high-risk flows, "regression" for medium, "smoke" for low. If a Zephyr client app section is present above, use those exact cycle names for app regression.
 - key_advice must reference actual ticket keys from the release (e.g. "ANDAPP-1234 changes the onboarding flow…").`;
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -1721,10 +1975,16 @@ Rules:
   if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.error?.message || `Claude SW error ${resp.status}`); }
   const data = await resp.json();
   const raw = data.content.filter(b=>b.type==='text').map(b=>b.text).join('');
+  // #region agent log
+  fetch('http://127.0.0.1:7262/ingest/d3dd6d7f-fa27-4176-98ba-4188dc1b6879',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f65e33'},body:JSON.stringify({sessionId:'f65e33',runId:'pre-fix',hypothesisId:'B',location:'firmware-regression-assessor.html:claudeAssessSW:raw',message:'SW Claude text response',data:{rawLen:raw.length,rawHead:raw.slice(0,120)},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   const parsed = parseJsonFromText(raw);
   if (!parsed) throw new Error('Could not parse SW assessment');
   // Normalise: the model might return {platforms:[...]} or [{...}] directly
   const platforms = parsed.platforms || (Array.isArray(parsed) ? parsed : [parsed]);
+  // #region agent log
+  fetch('http://127.0.0.1:7262/ingest/d3dd6d7f-fa27-4176-98ba-4188dc1b6879',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f65e33'},body:JSON.stringify({sessionId:'f65e33',runId:'pre-fix',hypothesisId:'C',location:'firmware-regression-assessor.html:claudeAssessSW:parsed',message:'SW parse normalise',data:{parsedKeys:parsed&&typeof parsed==='object'?Object.keys(parsed):[],platformsLen:platforms.length,firstAiPlatform:platforms[0]?.platform},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   return { software_assessment: { platforms } };
 }
 
@@ -1899,6 +2159,10 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
           const ai = platforms.find(p => p.platform === raw.platform);
           return { raw, ai };
         });
+
+        // #region agent log
+        fetch('http://127.0.0.1:7262/ingest/d3dd6d7f-fa27-4176-98ba-4188dc1b6879',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f65e33'},body:JSON.stringify({sessionId:'f65e33',runId:'pre-fix',hypothesisId:'D',location:'firmware-regression-assessor.html:renderResults:sw',message:'Software section merge',data:{rawPlatformsLen:rawPlatforms.length,aiPlatformsLen:platforms.length,rawLabels:rawPlatforms.map(p=>p.platform),aiLabels:platforms.map(p=>p.platform),matchedAi:allPlatforms.map(({raw,ai})=>({rawPl:raw.platform,hasAi:!!ai}))},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
 
         if (!allPlatforms.length) return '';
 
@@ -2232,9 +2496,10 @@ async function runAssessment() {
       log(`Zephyr project key(s): ${zephyrKeys.join(', ')}`, 'info');
       if (clientPlatformInputs.length) log(`Client platforms: ${clientPlatformInputs.map(p => `${p.platform} ${p.version}`).join(', ')}`, 'info');
 
-      const [confluenceContext, zephyrCycles, ...clientResults] = await Promise.all([
+      const [confluenceContext, zephyrCycles, clientZephyrCycles, ...clientResults] = await Promise.all([
         fetchConfluenceContextViaMcp(modelId, client).catch(e => { log(`Confluence failed: ${e.message}`, 'info'); return ''; }),
         fetchZephyrTestCyclesViaMcp(zephyrKeys, modelId, fwVersion, client).catch(e => { log(`Zephyr failed: ${e.message}`, 'info'); return ''; }),
+        fetchClientAppZephyrCyclesViaMcp(clientPlatformInputs, zephyrKeys, client).catch(e => { log(`Zephyr client app failed: ${e.message}`, 'info'); return ''; }),
         ...clientPlatformInputs.map(p =>
           fetchClientPlatformDataViaMcp(p.platform, p.version, client)
             .catch(e => { log(`Client platform fetch failed (${p.platform}): ${e.message}`, 'info'); return { platform: p.platform, version: p.version, tickets: [], goNoGoSummary: '' }; })
@@ -2242,7 +2507,11 @@ async function runAssessment() {
       ]);
 
       const clientPlatforms = clientResults;
-      log(`Confluence: ${confluenceContext.length} chars | Zephyr: ${zephyrCycles.length} chars | Client platforms: ${clientPlatforms.length}`, 'info');
+      log(`Confluence: ${confluenceContext.length} chars | Zephyr FW: ${zephyrCycles.length} chars | Zephyr client apps: ${clientZephyrCycles.length} chars | Client platforms: ${clientPlatforms.length}`, 'info');
+
+      // #region agent log
+      fetch('http://127.0.0.1:7262/ingest/d3dd6d7f-fa27-4176-98ba-4188dc1b6879',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f65e33'},body:JSON.stringify({sessionId:'f65e33',runId:'post-fix',hypothesisId:'A',location:'firmware-regression-assessor.html:postMcpGather',message:'MCP gather done; Anthropic + client snapshot',data:{hasAnthropicKey:!!anthropicKey,clientZephyrChars:clientZephyrCycles.length,zephyrFwChars:zephyrCycles.length,clientPlatformCount:clientPlatforms.length,perPlatform:clientPlatforms.map(p=>({platform:p.platform,version:p.version,ticketCount:(p.tickets||[]).length,goNoGoLen:(p.goNoGoSummary||'').length}))},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
 
       activateStep(4);
       if (anthropicKey) {
@@ -2251,8 +2520,14 @@ async function runAssessment() {
         const [fwAssessment, swResult] = await Promise.all([
           claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, anthropicKey, { ticketFullDetails: fullDetails, confluenceContext, zephyrCycles }),
           clientPlatforms.length
-            ? claudeAssessSW(clientPlatforms, modelId, fwVersion, anthropicKey)
-                .catch(e => { log(`SW assessment failed: ${e.message}`, 'info'); return null; })
+            ? claudeAssessSW(clientPlatforms, modelId, fwVersion, anthropicKey, { clientZephyrCycles })
+                .catch(e => {
+                  log(`SW assessment failed: ${e.message}`, 'info');
+                  // #region agent log
+                  fetch('http://127.0.0.1:7262/ingest/d3dd6d7f-fa27-4176-98ba-4188dc1b6879',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f65e33'},body:JSON.stringify({sessionId:'f65e33',runId:'pre-fix',hypothesisId:'B',location:'firmware-regression-assessor.html:claudeAssessSW:catch',message:'claudeAssessSW rejected',data:{err:String(e&&e.message||e)},timestamp:Date.now()})}).catch(()=>{});
+                  // #endregion
+                  return null;
+                })
             : Promise.resolve(null)
         ]);
         const assessment = { ...fwAssessment };
@@ -2260,8 +2535,19 @@ async function runAssessment() {
           assessment.software_assessment = swResult.software_assessment;
           log(`SW assessment done: ${swResult.software_assessment.platforms?.length || 0} platform(s)`, 'success');
         }
+        // #region agent log
+        fetch('http://127.0.0.1:7262/ingest/d3dd6d7f-fa27-4176-98ba-4188dc1b6879',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f65e33'},body:JSON.stringify({sessionId:'f65e33',runId:'pre-fix',hypothesisId:'B',location:'firmware-regression-assessor.html:afterClaudeParallel',message:'Parallel Claude finished',data:{swResultNull:swResult===null,mergedSw:!!swResult?.software_assessment,swPlatformCount:swResult?.software_assessment?.platforms?.length??-1,aiPlatformLabels:(swResult?.software_assessment?.platforms||[]).map(p=>p?.platform)},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+        if (!swResult?.software_assessment) {
+          // #region agent log
+          fetch('http://127.0.0.1:7262/ingest/d3dd6d7f-fa27-4176-98ba-4188dc1b6879',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f65e33'},body:JSON.stringify({sessionId:'f65e33',runId:'pre-fix',hypothesisId:'C',location:'firmware-regression-assessor.html:swNotMerged',message:'software_assessment not merged onto assessment',data:{clientPlatformsLen:clientPlatforms.length},timestamp:Date.now()})}).catch(()=>{});
+          // #endregion
+        }
         setTimeout(() => renderResults(assessment, tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, dataSource, clientPlatforms), 300);
       } else {
+        // #region agent log
+        fetch('http://127.0.0.1:7262/ingest/d3dd6d7f-fa27-4176-98ba-4188dc1b6879',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'f65e33'},body:JSON.stringify({sessionId:'f65e33',runId:'pre-fix',hypothesisId:'A',location:'firmware-regression-assessor.html:ruleBasedBranch',message:'No Anthropic key — skipping claudeAssessSW',data:{clientPlatformsLen:clientPlatforms.length},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
         const assessment = ruleBasedAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used);
         setTimeout(() => renderResults(assessment, tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, dataSource, clientPlatforms), 300);
       }
