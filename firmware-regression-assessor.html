@@ -452,16 +452,23 @@
 
       <!-- SW fields -->
       <div id="sw-fields" style="display:none">
-        <div class="sidebar-label" style="margin-top:8px">Release versions</div>
+        <div class="sidebar-label" style="margin-top:8px">Client type</div>
         <div class="field">
+          <select id="sw-client-type" onchange="onSwClientTypeChange()">
+            <option value="ios">iOS</option>
+            <option value="android">Android</option>
+            <option value="web">Web</option>
+          </select>
+        </div>
+        <div class="field" id="ios-version-field">
           <label>iOS Version</label>
           <input type="text" id="ios-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
         </div>
-        <div class="field">
+        <div class="field" id="android-version-field" style="display:none">
           <label>Android Version</label>
           <input type="text" id="android-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
         </div>
-        <div class="field">
+        <div class="field" id="web-version-field" style="display:none">
           <label>Web Version</label>
           <input type="text" id="web-version" placeholder="e.g. 1.5.2" autocomplete="off" spellcheck="false" />
         </div>
@@ -1709,9 +1716,10 @@ async function runAssessment() {
   const isFw           = releaseType === 'fw';
   const modelId        = isFw ? document.getElementById('model-id').value.trim() : '';
   const fwVersion      = isFw ? document.getElementById('fw-version').value.trim() : '';
-  const iosVersion     = !isFw ? document.getElementById('ios-version').value.trim() : '';
-  const androidVersion = !isFw ? document.getElementById('android-version').value.trim() : '';
-  const webVersion     = !isFw ? document.getElementById('web-version').value.trim() : '';
+  const swClient       = !isFw ? document.getElementById('sw-client-type').value : '';
+  const iosVersion     = (!isFw && swClient === 'ios')     ? document.getElementById('ios-version').value.trim() : '';
+  const androidVersion = (!isFw && swClient === 'android') ? document.getElementById('android-version').value.trim() : '';
+  const webVersion     = (!isFw && swClient === 'web')     ? document.getElementById('web-version').value.trim() : '';
   const swVersion      = [iosVersion && `iOS ${iosVersion}`, androidVersion && `Android ${androidVersion}`, webVersion && `Web ${webVersion}`].filter(Boolean).join(', ');
   const useMcp         = document.getElementById('use-mcp').checked;
   const bedrockCreds = (() => {
@@ -1840,6 +1848,13 @@ async function runAssessment() {
 
 }
 
+
+function onSwClientTypeChange() {
+  const client = document.getElementById('sw-client-type').value;
+  document.getElementById('ios-version-field').style.display     = client === 'ios'     ? 'block' : 'none';
+  document.getElementById('android-version-field').style.display = client === 'android' ? 'block' : 'none';
+  document.getElementById('web-version-field').style.display     = client === 'web'     ? 'block' : 'none';
+}
 
 function onReleaseTypeChange() {
   const isFw = document.getElementById('release-type').value === 'fw';
