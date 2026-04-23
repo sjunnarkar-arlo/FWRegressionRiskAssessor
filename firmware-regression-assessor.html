@@ -1671,11 +1671,12 @@ Return ONLY valid JSON (no markdown fences):
         "risk": "HIGH"|"MEDIUM"|"LOW",
         "risk_score": <1-100>,
         "summary": "<2-3 sentences about what changed client-side and testing focus>",
+        "key_advice": "<3-4 sentences of specific QA guidance for this platform release — highlight the highest-risk flows, any FW dependency, and what must pass before release>",
         "areas_at_risk": [
           {"name":"<feature area>","risk":"HIGH"|"MEDIUM"|"LOW","reason":"<max 12 words>","tickets":["KEY-1"]}
         ],
         "test_recommendations": [
-          {"priority":"P1"|"P2"|"P3","cycle":"<app test cycle name>","reason":"<reason, max 15 words>","tickets":["KEY-1"]}
+          {"priority":"P1"|"P2"|"P3","cycle":"<app test cycle name>","reason":"<reason, max 15 words>","tickets":["KEY-1"],"run_type":"full"|"smoke"|"regression"}
         ]
       }
     ]
@@ -1687,7 +1688,7 @@ Rules:
 - execution_report.troubled_areas: areas with FAILED/BLOCKED tests OR open high-priority tickets. safe_areas: areas where all tests PASSED AND related tickets are resolved.` : ''}
 - test_cycle_recommendations: ${hasZephyr ? 'ONLY use cycle names that appear in the Zephyr data above. P1 = directly touched area, P2 = shared dependency, P3 = regression safety net.' : '6-12 items covering all impacted FW areas. Every P1 must cite at least one ticket.'} P1 first. run_type: "full" for high-risk, "smoke" for low-risk, "regression" for medium.
 - Cross-project shared-code changes push risk_score higher.${hasClients ? `
-- software_assessment.platforms: one entry per platform provided. areas_at_risk: 3-6 items per platform, use real app feature names (Device Setup & Onboarding, Live View & Streaming, Video Playback, Smart Alerts & Notifications, Subscription & IAP, Account & Settings, Modes & Rules, Share & Permissions). test_recommendations: 4-8 items, P1 for directly impacted flows.` : ''}`;
+- software_assessment.platforms: one entry per platform provided. areas_at_risk: 3-6 items per platform, risk DESC, use real app feature names (Device Setup & Onboarding, Live View & Streaming, Video Playback, Smart Alerts & Notifications, Subscription & IAP, Account & Settings, Modes & Rules, Share & Permissions). test_recommendations: 4-8 items P1 first, run_type "full" for high-risk flows, "regression" for medium, "smoke" for low. key_advice: 3-4 sentences — specific to this app platform release, reference actual ticket keys and feature areas.` : ''}`;
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -1882,6 +1883,9 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
         };
 
         const platformBlocks = allPlatforms.map(({ raw, ai }) => {
+          const rC = ai ? (ai.risk === 'HIGH' ? 'high' : ai.risk === 'MEDIUM' ? 'medium' : 'low') : 'low';
+          const totalTickets = raw.tickets.length;
+
           const areaCards = (ai?.areas_at_risk || []).map(a => {
             const c = a.risk === 'HIGH' ? 'high' : a.risk === 'MEDIUM' ? 'medium' : 'low';
             return `<div class="sub-card ${c}">
@@ -1893,11 +1897,14 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
 
           const cycleRows = (ai?.test_recommendations || []).map(r => {
             const pc = r.priority==='P1'?'tc-p1':r.priority==='P2'?'tc-p2':'tc-p3';
+            const rc = (r.run_type||'').toLowerCase();
+            const runClass = rc==='full'?'run-full':rc==='smoke'?'run-smoke':'run-regression';
             return `<tr>
               <td><span class="tc-pri-badge ${pc}">${r.priority||'P2'}</span></td>
               <td><span class="cycle-name">${r.cycle||''}</span></td>
               <td><span style="font-family:var(--mono);font-size:10px;color:var(--accent2)">${(r.tickets||[]).join(', ')}</span></td>
               <td><span class="cycle-reason">${r.reason||''}</span></td>
+              <td><span class="run-type ${runClass}">${r.run_type||'regression'}</span></td>
             </tr>`;
           }).join('');
 
@@ -1911,7 +1918,6 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
                 `<span class="ticket-pri pri-p2">P2</span>`}
             </div>`).join('');
 
-          const totalTickets = raw.tickets.length;
           const overflow = totalTickets > 20 ? `<div style="padding:6px 0;font-family:var(--mono);font-size:10px;color:var(--hint)">… and ${totalTickets - 20} more tickets</div>` : '';
 
           return `
@@ -1920,34 +1926,57 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
               <div class="sw-platform-title">
                 <span class="sw-platform-name">${raw.platform}</span>
                 <span class="sw-platform-ver">${raw.version}</span>
-                ${ai ? `<span style="font-family:var(--mono);font-size:10px;color:var(--hint)">${totalTickets} tickets</span>` : ''}
+                <span style="font-family:var(--mono);font-size:10px;color:var(--hint)">${totalTickets} tickets</span>
               </div>
-              ${ai ? riskPill(ai.risk) : `<span style="font-family:var(--mono);font-size:10px;color:var(--hint)">no AI analysis</span>`}
+              ${ai
+                ? `<div style="display:flex;flex-direction:column;align-items:flex-end;gap:2px">
+                    <span style="font-family:var(--mono);font-size:10px;color:var(--hint)">risk score</span>
+                    <span style="font-family:var(--mono);font-size:22px;font-weight:600;line-height:1;color:var(--r-${rC})">${ai.risk_score||'?'}</span>
+                    ${riskPill(ai.risk)}
+                   </div>`
+                : `<span style="font-family:var(--mono);font-size:10px;color:var(--hint)">no AI analysis</span>`}
             </div>
             <div class="sw-platform-body">
-              ${ai?.summary ? `<div class="sw-platform-summary">${ai.summary}</div>` : ''}
+
+              ${ai?.summary ? `<div class="summary-banner ${rC}" style="margin-bottom:1.5rem">${ai.summary}</div>` : ''}
+
+              ${ai?.key_advice ? `
+              <div class="section">
+                <div class="section-header"><span class="section-title">QA advice</span></div>
+                <div class="advice-box"><p>${ai.key_advice}</p></div>
+              </div>` : ''}
 
               ${areaCards ? `
-              <div style="margin-bottom:12px">
-                <div class="section-header" style="margin-bottom:8px"><span class="section-title">Areas at risk</span><span class="section-count">${(ai?.areas_at_risk||[]).length}</span></div>
+              <div class="section">
+                <div class="section-header">
+                  <span class="section-title">App areas at risk</span>
+                  <span class="section-count">${(ai?.areas_at_risk||[]).length}</span>
+                </div>
                 <div class="sub-grid">${areaCards}</div>
               </div>` : ''}
 
               ${cycleRows ? `
-              <div style="margin-bottom:12px">
-                <div class="section-header" style="margin-bottom:8px"><span class="section-title">Test cycles</span><span class="section-count">${(ai?.test_recommendations||[]).length}</span></div>
+              <div class="section">
+                <div class="section-header">
+                  <span class="section-title">Test cycles to execute</span>
+                  <span class="section-count">${(ai?.test_recommendations||[]).length}</span>
+                </div>
                 <table class="cycle-table">
-                  <thead><tr><th>Pri</th><th>Cycle</th><th>Tickets</th><th>Reason</th></tr></thead>
+                  <thead><tr><th>Pri</th><th>Cycle</th><th>Tickets</th><th>Reason</th><th>Run</th></tr></thead>
                   <tbody>${cycleRows}</tbody>
                 </table>
               </div>` : ''}
 
               ${ticketRows ? `
-              <div>
-                <div class="section-header" style="margin-bottom:8px"><span class="section-title">Release tickets</span><span class="section-count">${totalTickets}</span></div>
+              <div class="section">
+                <div class="section-header">
+                  <span class="section-title">Tickets in this release</span>
+                  <span class="section-count">${totalTickets}</span>
+                </div>
                 <div class="ticket-list">${ticketRows}</div>
                 ${overflow}
               </div>` : (raw.goNoGoSummary ? `<div style="font-family:var(--mono);font-size:11px;color:var(--muted);line-height:1.6;max-height:200px;overflow-y:auto">${raw.goNoGoSummary.slice(0, 1200)}</div>` : '')}
+
             </div>
           </div>`;
         }).join('');
