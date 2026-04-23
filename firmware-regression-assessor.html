@@ -1843,9 +1843,35 @@ async function runAssessment() {
       const discovered = dataSource === 'email'
         ? await fetchEmailReleaseNotes(modelId, fwVersion, client)
         : await discoverCommitsViaMcp(modelId, fwVersion, client, swVersion);
-      const { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
+      let { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
+
+      // Fallback: if no ticket keys found in commits and swVersion is set,
+      // search Jira directly for tickets in this build/version
+      if (!ticketKeys.length && swVersion) {
+        log(`No ticket keys in commits — searching Jira for fixVersion "${swVersion}"`, 'info');
+        try {
+          const jiraTool = (await client.listTools()).find(t => t.name === 'jira_search')?.name || 'jira_search';
+          const raw = await client.callTool(jiraTool, {
+            jql: `fixVersion = "${swVersion}" ORDER BY priority ASC`,
+            fields: 'summary,priority,status,assignee',
+            limit: 50
+          });
+          const found = normalizeJiraResults(raw);
+          if (found.length) {
+            ticketKeys = found.map(t => t.key);
+            commitData = found.map(t => ({ sha: '—', msg: t.summary, repo: 'jira', keys: [t.key] }));
+            log(`Jira: ${found.length} tickets for version "${swVersion}"`, 'success');
+          }
+        } catch (e) {
+          log(`Jira fixVersion search failed: ${e.message}`, 'info');
+        }
+      }
+
       const sourceLabel = dataSource === 'email' ? 'release notes' : 'commits';
-      if (!ticketKeys.length) throw new Error(`No ticket keys found in ${sourceLabel} for ${modelId} ${fwVersion}.`);
+      if (!ticketKeys.length) {
+        const hint = swVersion ? `build "${swVersion}"` : `${modelId} ${fwVersion}`;
+        throw new Error(`No ticket keys found in ${sourceLabel} or Jira for ${hint}.`);
+      }
 
       activateStep(2);
       const { tickets, fullDetails } = await fetchJiraDetailsViaMcp(ticketKeys, client);
