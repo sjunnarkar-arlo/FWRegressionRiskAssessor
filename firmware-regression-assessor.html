@@ -746,7 +746,7 @@ function normalizeJiraResults(raw, fallbackKeys = []) {
 }
 
 // ── DIRECT MCP: COMMIT DISCOVERY ─────────────────────────
-async function discoverCommitsViaMcp(modelId, fwVersion, client) {
+async function discoverCommitsViaMcp(modelId, fwVersion, client, swVersion = '') {
   const tools = await client.listTools();
   const toolNames = tools.map(t => t.name);
   log(`Tools available: ${toolNames.join(', ')}`, 'info');
@@ -801,6 +801,43 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
         log(`${repo}@${ref}: ${parsed.length} commits`, 'success');
       }
     } catch {}
+  }
+
+  // iOS / Android search when SW/client version is provided
+  if (swVersion) {
+    log(`SW version "${swVersion}" — searching iOS and Android repos`, 'info');
+    for (const repo of ['ios', 'android-ori']) {
+      let ref = 'main';
+      try {
+        const tagsRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
+        const tags = JSON.parse(tagsRaw || '[]');
+        const tagMatch = tags.find(t => t.includes(swVersion) || swVersion.includes(t.replace(/^v/, '')));
+        if (tagMatch) {
+          ref = tagMatch;
+        } else {
+          const brRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
+          const branches = JSON.parse(brRaw || '[]');
+          const bMatch = branches.find(b => b.includes(swVersion)) ||
+                         branches.find(b => b.toLowerCase().includes('release')) ||
+                         branches.find(b => b === 'main') ||
+                         branches.find(b => b === 'master');
+          if (bMatch) ref = bMatch;
+        }
+      } catch {}
+
+      try {
+        const commitsRaw = await client.callTool(ghTool, {
+          command: `api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
+        });
+        const parsed = JSON.parse(commitsRaw);
+        if (Array.isArray(parsed) && parsed.length) {
+          allCommits.push(...parsed);
+          refsUsed[repo] = ref;
+          candidates.push(repo);
+          log(`${repo}@${ref}: ${parsed.length} commits`, 'success');
+        }
+      } catch {}
+    }
   }
 
   return { repos_searched: candidates, refs_used: refsUsed, commits: allCommits };
@@ -1799,7 +1836,7 @@ async function runAssessment() {
       activateStep(1);
       const discovered = dataSource === 'email'
         ? await fetchEmailReleaseNotes(modelId, fwVersion, client)
-        : await discoverCommitsViaMcp(modelId, fwVersion, client);
+        : await discoverCommitsViaMcp(modelId, fwVersion, client, swVersion);
       const { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
       const sourceLabel = dataSource === 'email' ? 'release notes' : 'commits';
       if (!ticketKeys.length) throw new Error(`No ticket keys found in ${sourceLabel} for ${modelId} ${fwVersion}.`);
