@@ -440,8 +440,16 @@
         <input type="text" id="fw-version" placeholder="e.g. 0.100.159_b075390" autocomplete="off" spellcheck="false" />
       </div>
       <div class="field">
-        <label>SW / Client Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
-        <input type="text" id="sw-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
+        <label>iOS Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
+        <input type="text" id="ios-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label>Android Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
+        <input type="text" id="android-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label>Web Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
+        <input type="text" id="web-version" placeholder="e.g. 1.5.2" autocomplete="off" spellcheck="false" />
       </div>
     </div>
 
@@ -746,7 +754,7 @@ function normalizeJiraResults(raw, fallbackKeys = []) {
 }
 
 // ── DIRECT MCP: COMMIT DISCOVERY ─────────────────────────
-async function discoverCommitsViaMcp(modelId, fwVersion, client, swVersion = '') {
+async function discoverCommitsViaMcp(modelId, fwVersion, client, { iosVersion = '', androidVersion = '', webVersion = '' } = {}) {
   const tools = await client.listTools();
   const toolNames = tools.map(t => t.name);
   log(`Tools available: ${toolNames.join(', ')}`, 'info');
@@ -809,21 +817,27 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client, swVersion = '')
     }
   }
 
-  // iOS / Android search when SW/client version is provided
-  if (swVersion) {
-    log(`SW version "${swVersion}" — searching iOS and Android repos`, 'info');
-    for (const repo of ['ios', 'android-ori']) {
+  // Per-platform client search — only runs for platforms with a version set
+  const clientTargets = [
+    iosVersion     && { repo: 'ios',         version: iosVersion     },
+    androidVersion && { repo: 'android-ori', version: androidVersion },
+    webVersion     && { repo: 'webclient',   version: webVersion     },
+  ].filter(Boolean);
+
+  if (clientTargets.length) {
+    log(`Client repos to search: ${clientTargets.map(t => t.repo).join(', ')}`, 'info');
+    for (const { repo, version } of clientTargets) {
       let ref = 'main';
       try {
         const tagsRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
         const tags = JSON.parse(tagsRaw || '[]');
-        const tagMatch = tags.find(t => t.includes(swVersion) || swVersion.includes(t.replace(/^v/, '')));
+        const tagMatch = tags.find(t => t.includes(version) || version.includes(t.replace(/^v/, '')));
         if (tagMatch) {
           ref = tagMatch;
         } else {
           const brRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
           const branches = JSON.parse(brRaw || '[]');
-          const bMatch = branches.find(b => b.includes(swVersion)) ||
+          const bMatch = branches.find(b => b.includes(version)) ||
                          branches.find(b => b.toLowerCase().includes('release')) ||
                          branches.find(b => b === 'main') ||
                          branches.find(b => b === 'master');
@@ -1783,7 +1797,10 @@ function runDemo() {
 async function runAssessment() {
   const modelId      = document.getElementById('model-id').value.trim();
   const fwVersion    = document.getElementById('fw-version').value.trim();
-  const swVersion    = document.getElementById('sw-version').value.trim();
+  const iosVersion     = document.getElementById('ios-version').value.trim();
+  const androidVersion = document.getElementById('android-version').value.trim();
+  const webVersion     = document.getElementById('web-version').value.trim();
+  const swVersion      = [iosVersion && `iOS ${iosVersion}`, androidVersion && `Android ${androidVersion}`, webVersion && `Web ${webVersion}`].filter(Boolean).join(', ');
   const useMcp       = document.getElementById('use-mcp').checked;
   const bedrockCreds = (() => {
     const keyId  = document.getElementById('bedrock-key-id').value.trim();
@@ -1842,34 +1859,41 @@ async function runAssessment() {
       activateStep(1);
       const discovered = dataSource === 'email'
         ? await fetchEmailReleaseNotes(modelId, fwVersion, client)
-        : await discoverCommitsViaMcp(modelId, fwVersion, client, swVersion);
+        : await discoverCommitsViaMcp(modelId, fwVersion, client, { iosVersion, androidVersion, webVersion });
       let { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
 
-      // Fallback: if no ticket keys found in commits and swVersion is set,
-      // search Jira directly for tickets in this build/version
-      if (!ticketKeys.length && swVersion) {
-        log(`No ticket keys in commits — searching Jira for fixVersion "${swVersion}"`, 'info');
-        try {
-          const jiraTool = (await client.listTools()).find(t => t.name === 'jira_search')?.name || 'jira_search';
-          const raw = await client.callTool(jiraTool, {
-            jql: `fixVersion = "${swVersion}" ORDER BY priority ASC`,
-            fields: 'summary,priority,status,assignee',
-            limit: 50
-          });
-          const found = normalizeJiraResults(raw);
-          if (found.length) {
-            ticketKeys = found.map(t => t.key);
-            commitData = found.map(t => ({ sha: '—', msg: t.summary, repo: 'jira', keys: [t.key] }));
-            log(`Jira: ${found.length} tickets for version "${swVersion}"`, 'success');
+      // Fallback: if no ticket keys found in commits, search Jira per client version
+      if (!ticketKeys.length && (iosVersion || androidVersion || webVersion)) {
+        const jiraTool = (await client.listTools()).find(t => t.name === 'jira_search')?.name || 'jira_search';
+        const seenKeys = new Set(ticketKeys);
+        for (const ver of [iosVersion, androidVersion, webVersion].filter(Boolean)) {
+          log(`No ticket keys in commits — searching Jira for fixVersion "${ver}"`, 'info');
+          try {
+            const raw = await client.callTool(jiraTool, {
+              jql: `fixVersion = "${ver}" ORDER BY priority ASC`,
+              fields: 'summary,priority,status,assignee',
+              limit: 50
+            });
+            const found = normalizeJiraResults(raw);
+            if (found.length) {
+              for (const t of found) {
+                if (!seenKeys.has(t.key)) {
+                  seenKeys.add(t.key);
+                  ticketKeys = [...ticketKeys, t.key];
+                  commitData = [...commitData, { sha: '—', msg: t.summary, repo: 'jira', keys: [t.key] }];
+                }
+              }
+              log(`Jira: ${found.length} tickets for version "${ver}"`, 'success');
+            }
+          } catch (e) {
+            log(`Jira fixVersion search failed for "${ver}": ${e.message}`, 'info');
           }
-        } catch (e) {
-          log(`Jira fixVersion search failed: ${e.message}`, 'info');
         }
       }
 
       const sourceLabel = dataSource === 'email' ? 'release notes' : 'commits';
       if (!ticketKeys.length) {
-        const hint = swVersion ? `build "${swVersion}"` : `${modelId} ${fwVersion}`;
+        const hint = swVersion || `${modelId} ${fwVersion}`.trim() || 'this release';
         throw new Error(`No ticket keys found in ${sourceLabel} or Jira for ${hint}.`);
       }
 
