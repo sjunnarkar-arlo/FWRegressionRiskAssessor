@@ -466,14 +466,35 @@
           <textarea id="email-content" placeholder="Paste the release notes email body here…" style="background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:8px 10px;color:var(--text);font-family:var(--mono);font-size:11px;width:100%;height:80px;outline:none;resize:vertical;line-height:1.4"></textarea>
         </div>
       </div>
-      <div class="field" style="margin-top:8px">
-        <label>Anthropic key <span style="font-size:10px;color:var(--hint)">(optional — for AI analysis)</span></label>
-        <input type="password" id="anthropic-key" placeholder="sk-ant-…" />
+      <div class="sidebar-section" style="margin-top:8px">
+        <div class="sidebar-label">AWS Bedrock <span style="font-size:10px;color:var(--hint)">(optional — for AI analysis)</span></div>
+        <div class="field">
+          <label>Access Key ID</label>
+          <input type="text" id="bedrock-key-id" placeholder="AKIA…" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label>Secret Access Key</label>
+          <input type="password" id="bedrock-secret" placeholder="••••••••" autocomplete="new-password" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label>Session Token <span style="font-size:10px;color:var(--hint)">(STS — recommended)</span></label>
+          <input type="password" id="bedrock-token" placeholder="optional — paste STS token" autocomplete="new-password" spellcheck="false" />
+        </div>
+        <div style="display:flex;gap:6px">
+          <div class="field" style="flex:1">
+            <label>Region</label>
+            <input type="text" id="bedrock-region" value="us-east-1" autocomplete="off" spellcheck="false" />
+          </div>
+        </div>
+        <div class="field">
+          <label>Model ID</label>
+          <input type="text" id="bedrock-model" value="us.anthropic.claude-sonnet-4-5-20251001-v1:0" autocomplete="off" spellcheck="false" style="font-size:10px" />
+        </div>
       </div>
       <div class="api-note">
-        <b style="color:var(--accent)">MCP on</b> → requires <code style="font-size:10px;color:var(--muted)">python proxy.py</code> + VPN. Choose <b style="color:var(--text)">GitHub commits</b> or <b style="color:var(--text)">Email release notes</b> as your data source. Add Anthropic key for AI analysis, or leave blank for rule-based scoring.<br><br>
+        <b style="color:var(--accent)">MCP on</b> → requires <code style="font-size:10px;color:var(--muted)">node proxy.js</code> + VPN. Add Bedrock credentials for AI analysis, or leave blank for rule-based scoring.<br><br>
         <b style="color:var(--hint)">MCP off</b> → demo mode (no data fetching).<br><br>
-        <a href="https://console.anthropic.com/settings/keys" target="_blank">Get Anthropic key ↗</a>
+        <b style="color:var(--accent)">Security tip:</b> Use short-lived STS credentials (<code style="font-size:10px;color:var(--muted)">aws sts get-session-token</code>) scoped to <code style="font-size:10px;color:var(--muted)">bedrock:InvokeModel</code> only. Never use root or broad IAM keys.
       </div>
     </div>
 
@@ -1436,7 +1457,40 @@ function log(msg, type = '') {
 }
 
 // ── STEP 3: CLAUDE RISK ASSESSMENT ──────────────────────
-async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearched, refsUsed, anthropicKey, extras = {}) {
+// ── AWS SIGV4 ─────────────────────────────────────────────
+async function sha256Hex(msg) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(msg));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+async function hmacSha256(key, msg) {
+  const k = await crypto.subtle.importKey('raw', typeof key === 'string' ? new TextEncoder().encode(key) : key, { name:'HMAC', hash:'SHA-256' }, false, ['sign']);
+  return crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg));
+}
+async function sigV4Headers(method, url, bodyStr, keyId, secret, token, region) {
+  const svc = 'bedrock';
+  const now = new Date();
+  const dt  = now.toISOString().replace(/[:\-]|\.\d{3}/g,'').slice(0,15) + 'Z';
+  const d   = dt.slice(0,8);
+  const { host, pathname } = new URL(url);
+  const payloadHash = await sha256Hex(bodyStr);
+  let canonHeaders = `content-type:application/json\nhost:${host}\nx-amz-date:${dt}\n`;
+  let signedHdrs   = 'content-type;host;x-amz-date';
+  if (token) { canonHeaders += `x-amz-security-token:${token}\n`; signedHdrs += ';x-amz-security-token'; }
+  const canonReq   = [method, pathname, '', canonHeaders, signedHdrs, payloadHash].join('\n');
+  const scope      = `${d}/${region}/${svc}/aws4_request`;
+  const sts        = `AWS4-HMAC-SHA256\n${dt}\n${scope}\n${await sha256Hex(canonReq)}`;
+  const kDate      = await hmacSha256('AWS4' + secret, d);
+  const kRegion    = await hmacSha256(new Uint8Array(kDate), region);
+  const kService   = await hmacSha256(new Uint8Array(kRegion), svc);
+  const kSigning   = await hmacSha256(new Uint8Array(kService), 'aws4_request');
+  const sigBuf     = await hmacSha256(new Uint8Array(kSigning), sts);
+  const sig        = Array.from(new Uint8Array(sigBuf)).map(b => b.toString(16).padStart(2,'0')).join('');
+  const hdrs = { 'Content-Type':'application/json', 'X-Amz-Date':dt, Authorization:`AWS4-HMAC-SHA256 Credential=${keyId}/${scope}, SignedHeaders=${signedHdrs}, Signature=${sig}` };
+  if (token) hdrs['X-Amz-Security-Token'] = token;
+  return hdrs;
+}
+
+async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearched, refsUsed, bedrockCreds, extras = {}) {
   const { ticketFullDetails = '', confluenceContext = '', zephyrCycles = '' } = extras;
   const repoSummary = Object.entries(refsUsed||{}).map(([r,ref]) => `${r}@${ref}`).join(', ') || reposSearched.join(', ');
 
@@ -1483,16 +1537,18 @@ Rules:
   : '6-12 items covering all impacted functional areas. Every P1 cycle must cite at least one ticket.'} P1 first. run_type: "full" for high-risk areas, "smoke" for low-risk, "regression" for medium.
 - Cross-project shared-code changes push risk_score higher.`;
 
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages: [{ role: 'user', content: prompt }] })
-  });
-  if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.error?.message || `Claude error ${resp.status}`); }
+  const { keyId, secret, token, region, bedrockModel } = bedrockCreds;
+  const url  = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(bedrockModel)}/invoke`;
+  const body = JSON.stringify({ anthropic_version: 'bedrock-2023-05-31', max_tokens: 4000, messages: [{ role: 'user', content: prompt }] });
+  let hdrs;
+  try { hdrs = await sigV4Headers('POST', url, body, keyId, secret, token || null, region); }
+  finally { /* credential strings stay in JS heap until GC; null local refs to release sooner */ bedrockCreds = null; }
+  const resp = await fetch(url, { method: 'POST', headers: hdrs, body });
+  if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.message || e['message'] || `Bedrock error ${resp.status}`); }
   const data = await resp.json();
-  const raw = data.content.filter(b=>b.type==='text').map(b=>b.text).join('');
+  const raw  = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
   const parsed = parseJsonFromText(raw);
-  if (!parsed) throw new Error('Could not parse risk assessment');
+  if (!parsed) throw new Error('Could not parse risk assessment from Bedrock response');
   return parsed;
 }
 
@@ -1677,12 +1733,23 @@ async function runAssessment() {
   const modelId      = document.getElementById('model-id').value.trim();
   const fwVersion    = document.getElementById('fw-version').value.trim();
   const useMcp       = document.getElementById('use-mcp').checked;
-  const anthropicKey = document.getElementById('anthropic-key').value.trim();
+  const bedrockCreds = (() => {
+    const keyId  = document.getElementById('bedrock-key-id').value.trim();
+    const secret = document.getElementById('bedrock-secret').value.trim();
+    if (!keyId || !secret) return null;
+    return {
+      keyId,
+      secret,
+      token:        document.getElementById('bedrock-token').value.trim() || null,
+      region:       document.getElementById('bedrock-region').value.trim() || 'us-east-1',
+      bedrockModel: document.getElementById('bedrock-model').value.trim() || 'us.anthropic.claude-sonnet-4-5-20251001-v1:0',
+    };
+  })();
 
 
 
   // ── DEMO MODE ─────────────────────────────────────────
-  if (!useMcp && !anthropicKey) {
+  if (!useMcp) {
     setLoading(['Locating repos for model', 'Scanning commits', 'Fetching Jira details', 'Running risk analysis']);
     [0,1,2,3].forEach((i) => setTimeout(() => activateStep(i), i * 600));
     setTimeout(runDemo, 2800);
@@ -1690,13 +1757,6 @@ async function runAssessment() {
   }
 
   const btn = document.getElementById('run-btn');
-
-  // ── API KEY WITHOUT MCP ────────────────────────────────
-  if (!useMcp && anthropicKey) {
-    document.getElementById('empty-state').style.display = 'none';
-    document.getElementById('output').innerHTML = `<div class="error-box">// GitHub, Jira, Confluence and Zephyr data require VPN access via Arlochat MCP.<br><br>Enable the <b style="color:var(--accent)">Direct Arlochat MCP</b> checkbox (requires VPN), then run again.<br><br>To test the UI without VPN, clear the API key and click Run for demo mode.</div>`;
-    return;
-  }
   btn.disabled = true;
   document.getElementById('btn-text').textContent = 'RUNNING…';
   _logEl = null;
@@ -1716,7 +1776,7 @@ async function runAssessment() {
       step1Label,
       'Jira: full ticket details',
       'Confluence + Zephyr: docs + template test cycles',
-      anthropicKey ? 'Claude AI risk analysis' : 'Rule-based risk analysis'
+      bedrockCreds ? 'Bedrock Claude risk analysis' : 'Rule-based risk analysis'
     ]);
     const client = new McpClient(
       `${window.location.origin}/mcp/sse`,
@@ -1747,8 +1807,8 @@ async function runAssessment() {
       log(`Confluence: ${confluenceContext.length} chars | Zephyr: ${zephyrCycles.length} chars`, 'info');
 
       activateStep(4);
-      const assessment = anthropicKey
-        ? await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, anthropicKey, { ticketFullDetails: fullDetails, confluenceContext, zephyrCycles })
+      const assessment = bedrockCreds
+        ? await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, bedrockCreds, { ticketFullDetails: fullDetails, confluenceContext, zephyrCycles })
         : ruleBasedAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used);
 
       setTimeout(() => renderResults(assessment, tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, dataSource), 300);
