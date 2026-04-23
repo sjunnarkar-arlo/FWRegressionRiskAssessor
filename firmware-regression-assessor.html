@@ -428,8 +428,29 @@
       <span class="logo-sub">Jira-powered · Claude AI</span>
     </div>
 
-    <input type="hidden" id="model-id" />
-    <input type="hidden" id="fw-version" />
+    <div class="sidebar-section">
+      <div class="sidebar-label">Release info <span style="font-size:10px;color:var(--hint);font-weight:normal;text-transform:none;letter-spacing:0">— auto-filled from email</span></div>
+      <div class="field">
+        <label>Model ID</label>
+        <input type="text" id="model-id" placeholder="e.g. VMC4040P" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label>FW Version</label>
+        <input type="text" id="fw-version" placeholder="e.g. 0.100.159_b075390" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label>iOS Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
+        <input type="text" id="ios-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label>Android Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
+        <input type="text" id="android-version" placeholder="e.g. 4.29.1.0" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label>Web Version <span style="font-size:10px;color:var(--hint)">(optional)</span></label>
+        <input type="text" id="web-version" placeholder="e.g. 1.5.2" autocomplete="off" spellcheck="false" />
+      </div>
+    </div>
 
     <div class="sidebar-section">
       <div class="sidebar-label">Data source</div>
@@ -543,7 +564,21 @@ class McpClient {
       const t = setTimeout(() => rej(new Error('MCP endpoint timeout (30s) — is VPN on and proxy.js running?')), 30000);
       this._onEndpoint = url => { clearTimeout(t); this.sessionUrl = url; res(); };
     });
-    await this._rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'fw-regression-assessor', version: '1.0' } });
+    // Small delay so the server-side session is fully registered before the first RPC
+    await new Promise(r => setTimeout(r, 300));
+    let initErr;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 1000));
+        await this._rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'fw-regression-assessor', version: '1.0' } });
+        initErr = null;
+        break;
+      } catch (e) {
+        initErr = e;
+        if (!e.message.includes('502')) break;
+      }
+    }
+    if (initErr) throw new Error(initErr.message + ' — check proxy.js console for details');
     await this._notify('notifications/initialized');
     this.onLog('MCP handshake complete', 'success');
   }
@@ -707,7 +742,7 @@ function normalizeJiraResults(raw, fallbackKeys = []) {
 }
 
 // ── DIRECT MCP: COMMIT DISCOVERY ─────────────────────────
-async function discoverCommitsViaMcp(modelId, fwVersion, client) {
+async function discoverCommitsViaMcp(modelId, fwVersion, client, { iosVersion = '', androidVersion = '', webVersion = '' } = {}) {
   const tools = await client.listTools();
   const toolNames = tools.map(t => t.name);
   log(`Tools available: ${toolNames.join(', ')}`, 'info');
@@ -715,53 +750,102 @@ async function discoverCommitsViaMcp(modelId, fwVersion, client) {
   const ghTool = toolNames.find(t => t === 'github_cli') || toolNames.find(t => t.includes('github')) || 'github_cli';
   log(`Using GitHub tool: ${ghTool}`, 'info');
 
-  // Find all repos in org
-  const repoRaw = await client.callTool(ghTool, {
-    command: `repo list arlo-engineering --limit 200 --json name --jq '[.[].name]'`
-  });
-  let allRepoNames = [];
-  try { allRepoNames = JSON.parse(repoRaw); } catch {}
-
-  // Filter candidates
-  const modelLower = modelId.toLowerCase();
-  const fallback = ['camif-mcu-harpy', 'camif-isp2mcu', 'nim', 'sv_rk1103b', 'fwbabycam'];
-  let candidates = allRepoNames.filter(r =>
-    r.toLowerCase().includes(modelLower) || r.toLowerCase().startsWith('camif') ||
-    r.toLowerCase().startsWith('fw') || r === 'nim' || r === 'sv_rk1103b'
-  );
-  if (!candidates.length) candidates = fallback;
-  candidates = candidates.slice(0, 6);
-  log(`Repos to search: ${candidates.join(', ')}`, 'info');
-
   const refsUsed = {}, allCommits = [];
+  let candidates = [];
 
-  for (const repo of candidates) {
-    // Find ref matching fwVersion
-    const tagsRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
-    let ref = 'master';
-    try {
-      const tags = JSON.parse(tagsRaw);
-      const match = tags.find(t => t.includes(fwVersion) || fwVersion.includes(t.replace(/^v/, '')));
-      if (match) { ref = match; }
-      else {
-        const brRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
-        const branches = JSON.parse(brRaw || '[]');
-        const bMatch = branches.find(b => b.includes(fwVersion)) || branches.find(b => b.includes('release'));
-        if (bMatch) ref = bMatch;
-      }
-    } catch {}
+  // Skip firmware search entirely when only SW/client version is provided
+  const fwSearch = !!(modelId || fwVersion);
 
-    const commitsRaw = await client.callTool(ghTool, {
-      command: `api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
+  if (fwSearch) {
+    // Find all repos in org
+    const repoRaw = await client.callTool(ghTool, {
+      command: `repo list arlo-engineering --limit 200 --json name --jq '[.[].name]'`
     });
-    try {
-      const parsed = JSON.parse(commitsRaw);
-      if (Array.isArray(parsed) && parsed.length) {
-        allCommits.push(...parsed);
-        refsUsed[repo] = ref;
-        log(`${repo}@${ref}: ${parsed.length} commits`, 'success');
-      }
-    } catch {}
+    let allRepoNames = [];
+    try { allRepoNames = JSON.parse(repoRaw); } catch {}
+
+    // Filter candidates
+    const modelLower = modelId.toLowerCase();
+    const fallback = ['camif-mcu-harpy', 'camif-isp2mcu', 'nim', 'sv_rk1103b', 'fwbabycam'];
+    candidates = allRepoNames.filter(r =>
+      (modelLower && r.toLowerCase().includes(modelLower)) || r.toLowerCase().startsWith('camif') ||
+      r.toLowerCase().startsWith('fw') || r === 'nim' || r === 'sv_rk1103b'
+    );
+    if (!candidates.length) candidates = fallback;
+    candidates = candidates.slice(0, 6);
+    log(`FW repos to search: ${candidates.join(', ')}`, 'info');
+
+    for (const repo of candidates) {
+      // Find ref matching fwVersion
+      const tagsRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
+      let ref = 'master';
+      try {
+        const tags = JSON.parse(tagsRaw);
+        const match = tags.find(t => t.includes(fwVersion) || fwVersion.includes(t.replace(/^v/, '')));
+        if (match) { ref = match; }
+        else {
+          const brRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
+          const branches = JSON.parse(brRaw || '[]');
+          const bMatch = branches.find(b => b.includes(fwVersion)) || branches.find(b => b.includes('release'));
+          if (bMatch) ref = bMatch;
+        }
+      } catch {}
+
+      const commitsRaw = await client.callTool(ghTool, {
+        command: `api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
+      });
+      try {
+        const parsed = JSON.parse(commitsRaw);
+        if (Array.isArray(parsed) && parsed.length) {
+          allCommits.push(...parsed);
+          refsUsed[repo] = ref;
+          log(`${repo}@${ref}: ${parsed.length} commits`, 'success');
+        }
+      } catch {}
+    }
+  }
+
+  // Per-platform client search — only runs for platforms with a version set
+  const clientTargets = [
+    iosVersion     && { repo: 'ios',         version: iosVersion     },
+    androidVersion && { repo: 'android-ori', version: androidVersion },
+    webVersion     && { repo: 'webclient',   version: webVersion     },
+  ].filter(Boolean);
+
+  if (clientTargets.length) {
+    log(`Client repos to search: ${clientTargets.map(t => t.repo).join(', ')}`, 'info');
+    for (const { repo, version } of clientTargets) {
+      let ref = 'main';
+      try {
+        const tagsRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/tags --jq '[.[:20] | .[].name]' 2>/dev/null || echo '[]'` });
+        const tags = JSON.parse(tagsRaw || '[]');
+        const tagMatch = tags.find(t => t.includes(version) || version.includes(t.replace(/^v/, '')));
+        if (tagMatch) {
+          ref = tagMatch;
+        } else {
+          const brRaw = await client.callTool(ghTool, { command: `api repos/arlo-engineering/${repo}/branches --jq '[.[].name]' 2>/dev/null || echo '[]'` });
+          const branches = JSON.parse(brRaw || '[]');
+          const bMatch = branches.find(b => b.includes(version)) ||
+                         branches.find(b => b.toLowerCase().includes('release')) ||
+                         branches.find(b => b === 'main') ||
+                         branches.find(b => b === 'master');
+          if (bMatch) ref = bMatch;
+        }
+      } catch {}
+
+      try {
+        const commitsRaw = await client.callTool(ghTool, {
+          command: `api "repos/arlo-engineering/${repo}/commits?sha=${ref}&per_page=60" --jq '[.[] | {sha: .sha[0:8], msg: .commit.message, repo: "${repo}"}]'`
+        });
+        const parsed = JSON.parse(commitsRaw);
+        if (Array.isArray(parsed) && parsed.length) {
+          allCommits.push(...parsed);
+          refsUsed[repo] = ref;
+          candidates.push(repo);
+          log(`${repo}@${ref}: ${parsed.length} commits`, 'success');
+        }
+      } catch {}
+    }
   }
 
   return { repos_searched: candidates, refs_used: refsUsed, commits: allCommits };
@@ -1248,7 +1332,7 @@ async function bedrockInvoke(url, messages, tools, bedrockCreds, system) {
 }
 
 async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearched, refsUsed, bedrockCreds, extras = {}) {
-  const { ticketFullDetails = '', projKey = '' } = extras;
+  const { ticketFullDetails = '', projKey = '', swVersion = '' } = extras;
   const repoSummary = Object.entries(refsUsed||{}).map(([r,ref]) => `${r}@${ref}`).join(', ') || reposSearched.join(', ');
   const client = extras.mcpClient || null;
 
@@ -1280,7 +1364,7 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
     },
     {
       name: 'zephyr_get_executions',
-      description: 'Get test executions (test cases and their steps) for a specific Zephyr test cycle. Use project_key="FWQE" for firmware regression template cycles.',
+      description: 'Get test executions for a Zephyr cycle. Use sparingly — only when needed. Use project_key="FWQE" for firmware cycles.',
       input_schema: {
         type: 'object',
         properties: {
@@ -1315,14 +1399,14 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
 
 ${client ? `You have access to Zephyr and Confluence tools. Follow these steps in order:
 
-1. Call zephyr_list(type="test_cases", project_key="FWQE") to retrieve all test case titles from the FWQE project. These titles are the canonical list of available test coverage for firmware releases.
-2. Read all the test case titles returned. Group them mentally by functional area (e.g. BLE Onboarding, Wi-Fi, OTA, Audio, Streaming, MCU/RTOS, etc.).
-3. Cross-reference those functional areas against the tickets and code changes in this release. Identify which test cases are relevant to what changed.
-4. Recommend the matching test cases by their exact titles as returned by Zephyr — do not invent or paraphrase names.
+1. Call zephyr_list(type="test_cases", project_key="${projKey}") to retrieve all test case titles from the ${projKey} project.
+2. Group the test case titles mentally by functional area (e.g. BLE Onboarding, Wi-Fi, OTA, Audio, Streaming, MCU/RTOS, etc.).
+3. Cross-reference those functional areas against the tickets and code changes. Identify which test cases are relevant to what changed.
+4. Recommend matching test cases by their exact titles — do not invent or paraphrase names.
 
-If zephyr_list returns no results or the FWQE project is not accessible, fall back to generating test cycle names based on the functional areas affected by the tickets (e.g. "BLE Onboarding Regression", "Wi-Fi Regression", "OTA Regression"). In that case add a coverage_gaps entry noting that Zephyr could not be accessed.
+If zephyr_list returns no results or the project is not accessible, fall back to generating test cycle names based on the functional areas affected by the tickets. Add a coverage_gaps entry noting Zephyr could not be accessed.
 
-Optionally call confluence_search to find model-specific documentation if you need more context about the device architecture.` : ''}
+Do NOT call confluence_search unless a ticket explicitly mentions an architecture question you cannot answer from the ticket text alone.` : ''}
 
 After gathering context, return ONLY valid JSON (no markdown fences):
 {
@@ -1353,7 +1437,7 @@ Rules:
     : ticketList;
   log(`Ticket context for Bedrock: ${ticketContext.length} chars`, 'info');
 
-  const userContent = `Analyze this firmware release for model "${modelId}" version "${fwVersion}" (repos: ${repoSummary}).
+  const userContent = `Analyze this firmware release for model "${modelId}" version "${fwVersion}"${swVersion ? ` (SW/client version: ${swVersion})` : ''} (repos: ${repoSummary}).
 
 ## TICKETS & CODE CHANGES
 ${ticketContext}
@@ -1366,8 +1450,10 @@ ${projKey ? `Jira project key: ${projKey}` : ''}`;
   log(`Bedrock turn 1: stop_reason=${data.stop_reason}`, 'info');
 
   // Agentic tool-use loop — Bedrock drives Zephyr/Confluence queries
+  // Stop passing tools after 7 turns to force the model to conclude
+  const MAX_TURNS = 10;
   let turns = 0;
-  while (data.stop_reason === 'tool_use' && turns < 15) {
+  while (data.stop_reason === 'tool_use' && turns < MAX_TURNS) {
     turns++;
     const assistantContent = data.content || [];
     messages.push({ role: 'assistant', content: assistantContent });
@@ -1386,14 +1472,24 @@ ${projKey ? `Jira project key: ${projKey}` : ''}`;
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result });
     }
 
+    // After 7 tool-use rounds, withhold tools so the model must produce the final JSON
+    const nextTools = turns >= 7 ? undefined : tools;
     messages.push({ role: 'user', content: toolResults });
-    data = await bedrockInvoke(url, messages, tools, creds, systemPrompt);
+    data = await bedrockInvoke(url, messages, nextTools, creds, systemPrompt);
     log(`Bedrock turn ${turns + 1}: stop_reason=${data.stop_reason}`, 'info');
   }
 
   const raw = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-  const parsed = parseJsonFromText(raw);
-  if (!parsed) throw new Error('Could not parse risk assessment from Bedrock response');
+  let parsed = parseJsonFromText(raw);
+  if (!parsed) {
+    log('Response was not JSON — sending recovery prompt', 'info');
+    messages.push({ role: 'assistant', content: data.content?.length ? data.content : [{ type: 'text', text: raw || '...' }] });
+    messages.push({ role: 'user', content: 'Output ONLY the JSON object now. Start with { and end with }. No preamble, no markdown fences, no explanation.' });
+    const recovery = await bedrockInvoke(url, messages, undefined, creds, systemPrompt);
+    const recoveryRaw = (recovery.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+    parsed = parseJsonFromText(recoveryRaw);
+    if (!parsed) throw new Error('Could not parse risk assessment from Bedrock response');
+  }
   return parsed;
 }
 
@@ -1464,19 +1560,8 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
       <div class="summary-banner ${rC}">${assessment.summary}</div>
 
       <div class="section">
-        <div class="section-header">
-          <span class="section-title">${sourceType === 'email' ? 'Release note items' : 'Commits scanned'}</span>
-          <span class="section-count">${commitData.length} with ticket refs</span>
-        </div>
-        <div style="font-family:var(--mono)">${commitStrip}</div>
-      </div>
-
-      <div class="section">
-        <div class="section-header">
-          <span class="section-title">Tickets in this release</span>
-          <span class="section-count">${tickets.length}</span>
-        </div>
-        <div class="ticket-list">${ticketRows}</div>
+        <div class="section-header"><span class="section-title">QA advice</span></div>
+        <div class="advice-box"><p>${assessment.key_advice}</p></div>
       </div>
 
       <div class="section">
@@ -1531,8 +1616,19 @@ function renderResults(assessment, tickets, commitData, modelId, fwVersion, repo
       </div>` : ''}
 
       <div class="section">
-        <div class="section-header"><span class="section-title">QA advice</span></div>
-        <div class="advice-box"><p>${assessment.key_advice}</p></div>
+        <div class="section-header">
+          <span class="section-title">Tickets in this release</span>
+          <span class="section-count">${tickets.length}</span>
+        </div>
+        <div class="ticket-list">${ticketRows}</div>
+      </div>
+
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">${sourceType === 'email' ? 'Release note items' : 'Commits scanned'}</span>
+          <span class="section-count">${commitData.length} with ticket refs</span>
+        </div>
+        <div style="font-family:var(--mono)">${commitStrip}</div>
       </div>
     </div>`;
 }
@@ -1595,6 +1691,10 @@ function runDemo() {
 async function runAssessment() {
   const modelId      = document.getElementById('model-id').value.trim();
   const fwVersion    = document.getElementById('fw-version').value.trim();
+  const iosVersion     = document.getElementById('ios-version').value.trim();
+  const androidVersion = document.getElementById('android-version').value.trim();
+  const webVersion     = document.getElementById('web-version').value.trim();
+  const swVersion      = [iosVersion && `iOS ${iosVersion}`, androidVersion && `Android ${androidVersion}`, webVersion && `Web ${webVersion}`].filter(Boolean).join(', ');
   const useMcp       = document.getElementById('use-mcp').checked;
   const bedrockCreds = (() => {
     const keyId  = document.getElementById('bedrock-key-id').value.trim();
@@ -1649,10 +1749,45 @@ async function runAssessment() {
       activateStep(1);
       const discovered = dataSource === 'email'
         ? await fetchEmailReleaseNotes(modelId, fwVersion, client)
-        : await discoverCommitsViaMcp(modelId, fwVersion, client);
-      const { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
+        : await discoverCommitsViaMcp(modelId, fwVersion, client, { iosVersion, androidVersion, webVersion });
+      let { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
+
+      // Fallback: search Jira only when the repo returned zero commits (bad version/branch).
+      // If commits exist but have no Jira keys, don't fall back — a fixVersion search
+      // would return tickets from all platforms sharing the same version number.
+      if (!ticketKeys.length && discovered.commits.length === 0 && (iosVersion || androidVersion || webVersion)) {
+        const jiraTool = (await client.listTools()).find(t => t.name === 'jira_search')?.name || 'jira_search';
+        const seenKeys = new Set(ticketKeys);
+        for (const ver of [iosVersion, androidVersion, webVersion].filter(Boolean)) {
+          log(`No ticket keys in commits — searching Jira for fixVersion "${ver}"`, 'info');
+          try {
+            const raw = await client.callTool(jiraTool, {
+              jql: `fixVersion = "${ver}" ORDER BY priority ASC`,
+              fields: 'summary,priority,status,assignee',
+              limit: 50
+            });
+            const found = normalizeJiraResults(raw);
+            if (found.length) {
+              for (const t of found) {
+                if (!seenKeys.has(t.key)) {
+                  seenKeys.add(t.key);
+                  ticketKeys = [...ticketKeys, t.key];
+                  commitData = [...commitData, { sha: '—', msg: t.summary, repo: 'jira', keys: [t.key] }];
+                }
+              }
+              log(`Jira: ${found.length} tickets for version "${ver}"`, 'success');
+            }
+          } catch (e) {
+            log(`Jira fixVersion search failed for "${ver}": ${e.message}`, 'info');
+          }
+        }
+      }
+
       const sourceLabel = dataSource === 'email' ? 'release notes' : 'commits';
-      if (!ticketKeys.length) throw new Error(`No ticket keys found in ${sourceLabel} for ${modelId} ${fwVersion}.`);
+      if (!ticketKeys.length) {
+        const hint = swVersion || `${modelId} ${fwVersion}`.trim() || 'this release';
+        throw new Error(`No ticket keys found in ${sourceLabel} or Jira for ${hint}.`);
+      }
 
       activateStep(2);
       const { tickets, fullDetails } = await fetchJiraDetailsViaMcp(ticketKeys, client);
@@ -1663,7 +1798,7 @@ async function runAssessment() {
       if (bedrockCreds) {
         // Bedrock drives Zephyr + Confluence queries itself via tool use
         activateStep(4);
-        assessment = await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, bedrockCreds, { ticketFullDetails: fullDetails, projKey, mcpClient: client });
+        assessment = await claudeAssess(tickets, commitData, modelId, fwVersion, discovered.repos_searched, discovered.refs_used, bedrockCreds, { ticketFullDetails: fullDetails, projKey, mcpClient: client, swVersion });
       } else {
         // Rule-based: pre-fetch Zephyr + Confluence and score locally
         const [confluenceContext, zephyrCycles] = await Promise.all([
