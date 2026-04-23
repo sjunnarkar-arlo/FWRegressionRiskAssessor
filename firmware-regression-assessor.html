@@ -429,17 +429,8 @@
       <span class="logo-sub">Jira-powered · Claude AI</span>
     </div>
 
-    <div class="sidebar-section">
-      <div class="sidebar-label">Release</div>
-      <div class="field">
-        <label>Model ID</label>
-        <input type="text" id="model-id" placeholder="Auto-filled from email" />
-      </div>
-      <div class="field">
-        <label>FW Version</label>
-        <input type="text" id="fw-version" placeholder="Auto-filled from email" />
-      </div>
-    </div>
+    <input type="hidden" id="model-id" />
+    <input type="hidden" id="fw-version" />
 
     <div class="sidebar-section">
       <div class="sidebar-label">Data source</div>
@@ -497,7 +488,7 @@
     <div class="empty-state" id="empty-state">
       <div class="empty-icon">⬡</div>
       <div class="empty-title">No assessment loaded</div>
-      <div class="empty-hint">Enter a model ID and FW version to begin</div>
+      <div class="empty-hint">Attach a release notes email to begin</div>
       <div class="empty-grid">
         <div class="empty-card">
           <div class="empty-card-label">Step 1</div>
@@ -1688,8 +1679,7 @@ async function runAssessment() {
   const useMcp       = document.getElementById('use-mcp').checked;
   const anthropicKey = document.getElementById('anthropic-key').value.trim();
 
-  if (!modelId)   { document.getElementById('model-id').focus(); return; }
-  if (!fwVersion) { document.getElementById('fw-version').focus(); return; }
+
 
   // ── DEMO MODE ─────────────────────────────────────────
   if (!useMcp && !anthropicKey) {
@@ -1773,9 +1763,6 @@ async function runAssessment() {
 
 }
 
-['model-id','fw-version'].forEach(id => {
-  document.getElementById(id).addEventListener('keydown', e => { if (e.key === 'Enter') runAssessment(); });
-});
 
 document.getElementById('use-mcp').addEventListener('change', function() {
   document.getElementById('source-field').style.display = this.checked ? 'block' : 'none';
@@ -1876,13 +1863,8 @@ function autofillFromSubject(subject) {
   if (!subject) return;
   const info = parseSubjectForModelInfo(subject);
   if (!info) return;
-  const modelEl = document.getElementById('model-id');
-  const verEl   = document.getElementById('fw-version');
-  modelEl.value = info.modelId;
-  verEl.value   = info.fwVersion;
-  modelEl.style.borderColor = 'var(--accent)';
-  verEl.style.borderColor   = 'var(--accent)';
-  setTimeout(() => { modelEl.style.borderColor = ''; verEl.style.borderColor = ''; }, 2000);
+  document.getElementById('model-id').value  = info.modelId;
+  document.getElementById('fw-version').value = info.fwVersion;
 }
 
 // File input: read .eml/.msg/.txt into textarea
