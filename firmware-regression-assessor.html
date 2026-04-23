@@ -1381,7 +1381,7 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
   const tools = client ? [
     {
       name: 'zephyr_list',
-      description: 'List Zephyr folders, test cycles, or test cases. Use type="folders" with project_key="FWQE" to find the regression template folder, type="cycles" with folder_id to list cycles in that folder, type="test_cases" with cycle_id to read test cases in a cycle.',
+      description: 'List Zephyr folders, test cycles, or test cases. To get all firmware test cases use type="test_cases" with project_key="FWQE". Can also use type="folders" or type="cycles" with a folder_id if needed.',
       input_schema: {
         type: 'object',
         properties: {
@@ -1431,13 +1431,12 @@ async function claudeAssess(tickets, commitData, modelId, fwVersion, reposSearch
 
 ${client ? `You have access to Zephyr and Confluence tools. Follow these steps in order:
 
-1. Call zephyr_list(type="folders", project_key="FWQE") to list folders in the FWQE Zephyr project.
-2. Find the folder whose name contains "regression template" (case-insensitive). If multiple match, prefer the most specific one.
-3. Call zephyr_list(type="cycles", project_key="FWQE", folder_id=<regression_template_folder_id>) to list all cycles in that folder.
-4. For each cycle whose name suggests relevance to the changes (based on functional area), call zephyr_get_executions(cycle_id=<id>, project_key="FWQE") or zephyr_list(type="test_cases", cycle_id=<id>, project_key="FWQE") to read its actual test cases and confirm what it covers.
-5. Recommend only cycles you have actually read from the FWQE regression template folder — use their exact names as they appear in Zephyr.
+1. Call zephyr_list(type="test_cases", project_key="FWQE") to retrieve all test case titles from the FWQE project. These titles are the canonical list of available test coverage for firmware releases.
+2. Read all the test case titles returned. Group them mentally by functional area (e.g. BLE Onboarding, Wi-Fi, OTA, Audio, Streaming, MCU/RTOS, etc.).
+3. Cross-reference those functional areas against the tickets and code changes in this release. Identify which test cases are relevant to what changed.
+4. Recommend the matching test cases by their exact titles as returned by Zephyr — do not invent or paraphrase names.
 
-If you cannot find the FWQE project, the regression template folder, or any cycles within it, fall back to generating cycle names based on the functional areas affected by the tickets (e.g. "BLE Onboarding Regression", "Wi-Fi Regression", "OTA Regression"). In that case, set a "coverage_gaps" entry noting that Zephyr template could not be accessed.
+If zephyr_list returns no results or the FWQE project is not accessible, fall back to generating test cycle names based on the functional areas affected by the tickets (e.g. "BLE Onboarding Regression", "Wi-Fi Regression", "OTA Regression"). In that case add a coverage_gaps entry noting that Zephyr could not be accessed.
 
 Optionally call confluence_search to find model-specific documentation if you need more context about the device architecture.` : ''}
 
