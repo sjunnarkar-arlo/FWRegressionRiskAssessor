@@ -1710,6 +1710,26 @@ function runDemo() {
   );
 }
 
+// Projects that belong to OTHER platforms — filter these out to prevent cross-platform bleed.
+// Keys listed here are excluded when their platform is NOT the selected one.
+const PLATFORM_EXCLUDE = {
+  ios:     ['ANDAPP', 'WEBAPP', 'WAC', 'VI', 'WEBAPI', 'WEBC'],
+  android: ['WEBAPP', 'WAC', 'VI', 'WEBAPI', 'WEBC'],
+  web:     ['ANDAPP'],
+  fw:      [],
+};
+
+function filterByPlatform(ticketKeys, commitData, swClient) {
+  const excluded = PLATFORM_EXCLUDE[swClient];
+  if (!excluded || !excluded.length) return { ticketKeys, commitData };
+  const keep = k => !excluded.includes(k.split('-')[0]);
+  const filteredKeys = ticketKeys.filter(keep);
+  const filteredCommits = commitData
+    .map(c => ({ ...c, keys: (c.keys || []).filter(keep) }))
+    .filter(c => c.keys.length > 0);
+  return { ticketKeys: filteredKeys, commitData: filteredCommits };
+}
+
 // ── MAIN RUN ─────────────────────────────────────────────
 async function runAssessment() {
   const releaseType    = document.getElementById('release-type').value;
@@ -1778,17 +1798,24 @@ async function runAssessment() {
         : await discoverCommitsViaMcp(modelId, fwVersion, client, { iosVersion, androidVersion, webVersion });
       let { commitData, ticketKeys } = extractTicketKeys(discovered.commits);
 
+      // Strip cross-platform ticket references (e.g. ANDAPP keys in iOS commits)
+      if (!isFw && swClient) {
+        ({ commitData, ticketKeys } = filterByPlatform(ticketKeys, commitData, swClient));
+      }
+
       // Fallback: search Jira only when the repo returned zero commits (bad version/branch).
       // If commits exist but have no Jira keys, don't fall back — a fixVersion search
       // would return tickets from all platforms sharing the same version number.
       if (!ticketKeys.length && discovered.commits.length === 0 && (iosVersion || androidVersion || webVersion)) {
         const jiraTool = (await client.listTools()).find(t => t.name === 'jira_search')?.name || 'jira_search';
         const seenKeys = new Set(ticketKeys);
+        const excludedProjects = PLATFORM_EXCLUDE[swClient] || [];
+        const projectExclusion = excludedProjects.length ? ` AND project not in (${excludedProjects.join(', ')})` : '';
         for (const ver of [iosVersion, androidVersion, webVersion].filter(Boolean)) {
           log(`No ticket keys in commits — searching Jira for fixVersion "${ver}"`, 'info');
           try {
             const raw = await client.callTool(jiraTool, {
-              jql: `fixVersion = "${ver}" ORDER BY priority ASC`,
+              jql: `fixVersion = "${ver}"${projectExclusion} ORDER BY priority ASC`,
               fields: 'summary,priority,status,assignee',
               limit: 50
             });
